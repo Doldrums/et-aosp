@@ -8,6 +8,7 @@
 #include <linux/kref.h>
 #include <linux/list.h>
 #include <linux/spinlock.h>
+#include <linux/mutex.h>
 #include <linux/rbtree.h>
 #include <linux/maple_tree.h>
 #include <linux/rwsem.h>
@@ -556,6 +557,19 @@ struct vm_area_struct {
 } __randomize_layout;
 
 struct kioctx_table;
+
+#ifdef CONFIG_COALAPAGING
+struct coala_hints_struct {
+	void *hints;	/* xarray */
+	unsigned long *index;
+	unsigned long epoch;
+
+	atomic64_t contptes;
+	atomic64_t pmds;
+	atomic64_t contpmds;
+};
+#endif /* CONFIG_COALAPAGING */
+
 struct mm_struct {
 	struct {
 		struct maple_tree mm_mt;
@@ -783,6 +797,18 @@ struct mm_struct {
 
 		ANDROID_KABI_RESERVE(1);
 	} __randomize_layout;
+
+#ifdef CONFIG_COALAPAGING
+	/* coalapging enable-toggle for this mm */
+	bool coalapaging;
+	/* pagesize hints */
+	struct coala_hints_struct coala_hints;
+#endif /* CONFIG_COALAPAGING */
+
+#ifdef CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS
+	bool et_enabled;
+	struct et_batch *ebc;
+#endif /* CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS */
 
 	/*
 	 * The mm_cpumask needs to be at the end of mm_struct, because it

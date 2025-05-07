@@ -199,9 +199,9 @@ static void show_pte(unsigned long addr)
  *
  * Returns whether or not the PTE actually changed.
  */
-int ptep_set_access_flags(struct vm_area_struct *vma,
+int entry_set_access_flags(struct vm_area_struct *vma,
 			  unsigned long address, pte_t *ptep,
-			  pte_t entry, int dirty)
+			  pte_t entry, int dirty, bool is_pmd)
 {
 	pteval_t old_pteval, pteval;
 	pte_t pte = READ_ONCE(*ptep);
@@ -220,6 +220,32 @@ int ptep_set_access_flags(struct vm_area_struct *vma,
 	 */
 	pte_val(entry) ^= PTE_RDONLY;
 	pteval = pte_val(pte);
+
+#ifdef CONFIG_ARM64_ELASTIC_TRANSLATIONS
+	/* FIXME: Figure out how to handle HWAFDBM */
+	if (is_et_enabled(vma->vm_mm)) {
+		struct et_ctx ctx = {
+			.mm = vma->vm_mm,
+			.addr = address,
+			.ptep = ptep,
+			.level = is_pmd ? ET_PMD : ET_PTE,
+		};
+
+		pteval ^= PTE_RDONLY;
+		pteval |= pte_val(entry);
+		pteval ^= PTE_RDONLY;
+
+		ctx.pte = __pte(pteval);
+
+		et_set_entry_at(&ctx);
+
+		/* Invalidate a stale read-only entry */
+		if (dirty)
+			flush_tlb_page(vma, address);
+		return 1;
+	}
+#endif /* CONFIG_ARM64_ELASTIC_TRANSLATIONS */
+
 	do {
 		old_pteval = pteval;
 		pteval ^= PTE_RDONLY;
@@ -232,6 +258,13 @@ int ptep_set_access_flags(struct vm_area_struct *vma,
 	if (dirty)
 		flush_tlb_page(vma, address);
 	return 1;
+}
+
+int ptep_set_access_flags(struct vm_area_struct *vma,
+	unsigned long address, pte_t *ptep,
+	pte_t entry, int dirty)
+{
+return entry_set_access_flags(vma, address, ptep, entry, dirty, false);
 }
 
 static bool is_el1_instruction_abort(unsigned long esr)

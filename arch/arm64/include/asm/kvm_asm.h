@@ -100,6 +100,7 @@ enum __kvm_host_smccc_func {
 #ifdef CONFIG_ANDROID_ARM64_WORKAROUND_DMA_BEYOND_POC
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_set_stage2_memattr,
 #endif
+	__KVM_HOST_SMCCC_FUNC___kvm_tlb_flush_range,
 
 	/*
 	 * Start of the dynamically registered hypercalls. Start a bit
@@ -269,6 +270,14 @@ extern void __kvm_flush_cpu_context(struct kvm_s2_mmu *mmu);
 extern void __kvm_tlb_flush_vmid_ipa(struct kvm_s2_mmu *mmu, phys_addr_t ipa,
 				     int level);
 extern void __kvm_tlb_flush_vmid(struct kvm_s2_mmu *mmu);
+
+#ifdef CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS
+/*
+ * __tcr_flush_tlb_range() adapted for KVM
+ */
+extern void __kvm_tlb_flush_range(struct kvm_s2_mmu *mmu, phys_addr_t ipa,
+					int level);
+#endif /* CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS */
 
 extern void __kvm_timer_set_cntvoff(u64 cntvoff);
 

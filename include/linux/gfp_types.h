@@ -55,6 +55,9 @@ typedef unsigned int __bitwise gfp_t;
 #define ___GFP_SKIP_KASAN_UNPOISON	0
 #define ___GFP_SKIP_KASAN_POISON	0
 #endif
+#ifdef CONFIG_COALAPAGING
+#define ___GFP_ETRECLAIM 0x1000000u
+#endif /* CONFIG_COALAPAGING */
 #ifdef CONFIG_CMA
 #define ___GFP_CMA			0x8000000u
 #else
@@ -229,6 +232,10 @@ typedef unsigned int __bitwise gfp_t;
 #define __GFP_RETRY_MAYFAIL	((__force gfp_t)___GFP_RETRY_MAYFAIL)
 #define __GFP_NOFAIL	((__force gfp_t)___GFP_NOFAIL)
 #define __GFP_NORETRY	((__force gfp_t)___GFP_NORETRY)
+
+#ifdef CONFIG_COALAPAGING
+#define __GFP_ETRECLAIM	((__force gfp_t)___GFP_ETRECLAIM)
+#endif /* CONFIG_COALAPAGING */
 
 /**
  * DOC: Action modifiers

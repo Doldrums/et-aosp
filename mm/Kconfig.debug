@@ -237,3 +237,9 @@ config PER_VMA_LOCK_STATS
 	  overhead in the page fault path.
 
 	  If in doubt, say N.
+
+config DEBUG_COALAPAGING
+	bool "Enable debugging for COALAPaging"
+
+config DEBUG_ET
+	bool "Enable debugging for ET"

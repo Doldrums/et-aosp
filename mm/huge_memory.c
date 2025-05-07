@@ -47,6 +47,10 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/thp.h>
 
+#ifdef CONFIG_COALAPAGING
+#include <linux/coalapaging.h>
+#endif /* CONFIG_COALAPAGING */
+
 /*
  * By default, transparent hugepage support is disabled in order to avoid
  * risking an increased memory footprint for applications that are not
@@ -792,6 +796,11 @@ vm_fault_t do_huge_pmd_anonymous_page(struct vm_fault *vmf)
 	if (unlikely(anon_vma_prepare(vma)))
 		return VM_FAULT_OOM;
 	khugepaged_enter_vma(vma, vma->vm_flags);
+
+#ifdef CONFIG_COALAPAGING
+	if (coala_skip_thp(vma, haddr))
+		return VM_FAULT_FALLBACK;
+#endif /* CONFIG_COALAPAGING */
 
 	if (!(vmf->flags & FAULT_FLAG_WRITE) &&
 			!mm_forbids_zeropage(vma->vm_mm) &&

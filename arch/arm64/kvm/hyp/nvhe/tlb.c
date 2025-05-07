@@ -225,3 +225,9 @@ void __kvm_flush_vm_context(void)
 
 	dsb(ish);
 }
+
+#ifdef CONFIG_ARM64_ELASTIC_TRANSLATIONS
+void __kvm_tlb_flush_range(struct kvm_s2_mmu *mmu, phys_addr_t ipa, int level)
+{
+}
+#endif /* CONFIG_ARM64_ELASTIC_TRANSLATIONS */

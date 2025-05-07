@@ -7096,7 +7096,11 @@ unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 		.nr_to_reclaim = SWAP_CLUSTER_MAX,
 		.gfp_mask = current_gfp_context(gfp_mask),
 		.reclaim_idx = gfp_zone(gfp_mask),
+#ifdef CONFIG_COALAPAGING
+		.order = (gfp_mask & __GFP_ETRECLAIM) ? MAX_ORDER - 1 : order,
+#else /* !CONFIG_COALAPAGING */
 		.order = order,
+#endif /* !CONFIG_COALAPAGING */
 		.nodemask = nodemask,
 		.priority = DEF_PRIORITY,
 		.may_writepage = !laptop_mode,

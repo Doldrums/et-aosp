@@ -514,6 +514,13 @@ static inline void dec_tlb_flush_pending(struct mm_struct *mm)
 	 * Therefore we must rely on tlb_flush_*() to guarantee order.
 	 */
 	atomic_dec(&mm->tlb_flush_pending);
+
+#ifdef CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS
+	if (mm->ebc && __READ_ONCE(mm->ebc->batch_vpn)) {
+		pr_crit("0x%lx", mm->ebc->batch_vpn);
+		BUG_ON(1);
+	}
+#endif /* CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS */
 }
 
 static inline bool mm_tlb_flush_pending(struct mm_struct *mm)

@@ -110,6 +110,14 @@
 #define IF_HAVE_PG_OEM_RESERVED(_name)
 #endif
 
+#ifdef CONFIG_COALAPAGING
+#define IF_HAVE_PG_PCPLOCKED(flag,string) ,{1UL << flag, string}
+#define IF_HAVE_PG_LESHY(flag,string) ,{1UL << flag, string}
+#else
+#define IF_HAVE_PG_PCPLOCKED(flag,string)
+#define IF_HAVE_PG_LESHY(flag,string)
+#endif /* CONFIG_COALAPAGING */
+
 #define __def_pageflag_names						\
 	{1UL << PG_locked,		"locked"	},		\
 	{1UL << PG_waiters,		"waiters"	},		\
@@ -142,7 +150,9 @@ IF_HAVE_PG_OEM_RESERVED(oem_reserved_1)					\
 IF_HAVE_PG_OEM_RESERVED(oem_reserved_2)					\
 IF_HAVE_PG_OEM_RESERVED(oem_reserved_3)					\
 IF_HAVE_PG_OEM_RESERVED(oem_reserved_4)					\
-IF_HAVE_PG_SKIP_KASAN_POISON(PG_skip_kasan_poison, "skip_kasan_poison")
+IF_HAVE_PG_SKIP_KASAN_POISON(PG_skip_kasan_poison, "skip_kasan_poison") \
+IF_HAVE_PG_PCPLOCKED(PG_pcplocked, "pcplocked") \
+IF_HAVE_PG_LESHY(PG_leshy, "leshy")
 
 #define show_page_flags(flags)						\
 	(flags) ? __print_flags(flags, "|",				\

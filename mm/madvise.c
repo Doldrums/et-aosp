@@ -39,6 +39,10 @@
 #include "internal.h"
 #include "swap.h"
 
+#ifdef CONFIG_COALAPAGING
+#include <linux/coalapaging.h>
+#endif
+
 struct madvise_walk_private {
 	struct mmu_gather *tlb;
 	bool pageout;
@@ -63,7 +67,20 @@ static int madvise_need_mmap_write(int behavior)
 	case MADV_POPULATE_READ:
 	case MADV_POPULATE_WRITE:
 	case MADV_COLLAPSE:
+#ifdef CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS
+	case MADV_ELASTIC:
+#endif /* CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS */
+#ifdef CONFIG_COALAPAGING
+	case MADV_COALA:
+	case MADV_COALA_HINT_64K:
+	case MADV_COALA_HINT_2M:
+	case MADV_COALA_HINT_32M:
+#endif /* CONFIG_COALAPAGING */
 		return 0;
+#ifdef CONFIG_COALAPAGING
+	case MADV_COALA_HINT_KHUGE:
+		return 1;
+#endif /* CONFIG_COALAPAGING */
 	default:
 		/* be safe, default to 1. list exceptions explicitly */
 		return 1;
@@ -1225,6 +1242,16 @@ madvise_behavior_valid(int behavior)
 	case MADV_SOFT_OFFLINE:
 	case MADV_HWPOISON:
 #endif
+#ifdef CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS
+	case MADV_ELASTIC:
+#endif /* CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS */
+#ifdef CONFIG_COALAPAGING
+	case MADV_COALA:
+	case MADV_COALA_HINT_64K:
+	case MADV_COALA_HINT_2M:
+	case MADV_COALA_HINT_32M:
+	case MADV_COALA_HINT_KHUGE:
+#endif /* CONFIG_COALAPAGING */
 		return true;
 
 	default:
@@ -1239,6 +1266,16 @@ static bool process_madvise_behavior_valid(int behavior)
 	case MADV_PAGEOUT:
 	case MADV_WILLNEED:
 	case MADV_COLLAPSE:
+#ifdef CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS
+	case MADV_ELASTIC:
+#endif /* CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS */
+#ifdef CONFIG_COALAPAGING
+	case MADV_COALA:
+	case MADV_COALA_HINT_64K:
+	case MADV_COALA_HINT_2M:
+	case MADV_COALA_HINT_32M:
+	case MADV_COALA_HINT_KHUGE:
+#endif /* CONFIG_COALAPAGING */
 		return true;
 	default:
 		return false;
@@ -1473,10 +1510,38 @@ int do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int beh
 		mmap_read_lock(mm);
 	}
 
+#ifdef CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS
+	/* Enable ET for the whole mm */
+	if (behavior == MADV_ELASTIC) { //FIXME: && start == 0 && end == ULONG_MAX) {
+		mm->et_enabled = true;
+		error = 0;
+		goto out_unlock;
+	}
+#endif /* CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS */
+
+#ifdef CONFIG_COALAPAGING
+	/* Enable CAPaging for the whole mm */
+	if (behavior == MADV_COALA) { // FIXME: && start == 0 && end == ULONG_MAX) {
+		mm->coalapaging = true;
+		error = 0;
+		goto out_unlock;
+	}
+
+	if (behavior >= MADV_COALA_HINT_64K && behavior <= MADV_COALA_HINT_KHUGE) {
+		error = coala_madvise_hint(mm, start, start + len_in, behavior);
+		goto out_unlock;
+	}
+#endif /* CONFIG_COALAPAGING */
+
 	blk_start_plug(&plug);
 	error = madvise_walk_vmas(mm, start, end, behavior,
 			madvise_vma_behavior);
 	blk_finish_plug(&plug);
+
+#if defined(CONFIG_COALAPAGING) || defined(CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS)
+out_unlock:
+#endif
+
 	if (write)
 		mmap_write_unlock(mm);
 	else
@@ -1501,12 +1566,34 @@ SYSCALL_DEFINE5(process_madvise, int, pidfd, const struct iovec __user *, vec,
 	struct mm_struct *mm;
 	size_t total_len;
 	unsigned int f_flags;
+#if defined(CONFIG_COALAPAGING) || defined(CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS)
+	bool unchecked = false;
+#endif
 
 	if (flags != 0) {
 		ret = -EINVAL;
 		goto out;
 	}
 
+#ifdef CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS
+	/* Enable ET for the whole mm */
+	if (behavior == MADV_ELASTIC) {
+		unchecked = true;
+	}
+#endif /* CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS */
+
+#ifdef CONFIG_COALAPAGING
+	if (behavior == MADV_COALA ||
+		(behavior >= MADV_COALA_HINT_64K && behavior <= MADV_COALA_HINT_KHUGE)) {
+		unchecked = true;
+	}
+#endif /* CONFIG_COALAPAGING */
+
+#if defined(CONFIG_COALAPAGING) || defined(CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS)
+	if (unchecked) {
+		ret = __import_iovec_unchecked(READ, vec, vlen, ARRAY_SIZE(iovstack), &iov, &iter);
+	} else
+#endif
 	ret = import_iovec(ITER_DEST, vec, vlen, ARRAY_SIZE(iovstack), &iov, &iter);
 	if (ret < 0)
 		goto out;

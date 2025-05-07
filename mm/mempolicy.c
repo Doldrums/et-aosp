@@ -109,6 +109,17 @@
 
 #include "internal.h"
 
+#ifdef CONFIG_COALAPAGING
+#include <linux/coalapaging.h>
+#endif /* CONFIG_COALAPAGING */
+
+#ifdef CONFIG_PFTRACE
+#include <linux/tracepoint-defs.h>
+
+DECLARE_TRACEPOINT(allocpages);
+void do_trace_allocpages(unsigned long cycles);
+#endif /* CONFIG_PFTRACE */
+
 /* Internal flags */
 #define MPOL_MF_DISCONTIG_OK (MPOL_MF_INTERNAL << 0)	/* Skip checks for continuous vmas */
 #define MPOL_MF_INVERT (MPOL_MF_INTERNAL << 1)		/* Invert check for nodemask */

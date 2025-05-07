@@ -338,6 +338,11 @@ ssize_t import_iovec(int type, const struct iovec __user *uvec,
 ssize_t __import_iovec(int type, const struct iovec __user *uvec,
 		 unsigned nr_segs, unsigned fast_segs, struct iovec **iovp,
 		 struct iov_iter *i, bool compat);
+#ifdef CONFIG_COALAPAGING
+ssize_t __import_iovec_unchecked(int type, const struct iovec __user *uvec,
+		unsigned nr_segs, unsigned fast_segs, struct iovec **iovp,
+		struct iov_iter *i);
+#endif /* CONFIG_COALAAPAGING */
 int import_single_range(int type, void __user *buf, size_t len,
 		 struct iovec *iov, struct iov_iter *i);
 

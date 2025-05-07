@@ -238,6 +238,10 @@ struct alloc_context {
 	 */
 	enum zone_type highest_zoneidx;
 	bool spread_dirty_pages;
+
+#ifdef CONFIG_COALAPAGING
+	struct coalareq *coalareq;
+#endif /* CONFIG_COALAPAGING */
 };
 
 /*
@@ -436,6 +440,9 @@ struct compact_control {
 	bool contended;			/* Signal lock contention */
 	bool rescan;			/* Rescanning the same pageblock */
 	bool alloc_contig;		/* alloc_contig_range allocation */
+
+	struct list_head isofreepages;
+	unsigned long nr_isofreepages;
 };
 
 /*

@@ -69,15 +69,24 @@ static inline void count_compact_events(enum vm_event_item item, long delta)
 #define COMPACTION_HPAGE_ORDER	(PMD_SHIFT - PAGE_SHIFT)
 #endif
 
-static unsigned long release_freepages(struct list_head *freelist)
+static unsigned long release_freepages(struct list_head *freelist, bool et)
 {
 	struct page *page, *next;
 	unsigned long high_pfn = 0;
 
 	list_for_each_entry_safe(page, next, freelist, lru) {
 		unsigned long pfn = page_to_pfn(page);
+		int order = page_private(page);
+
 		list_del(&page->lru);
-		__free_page(page);
+
+		if (et) {
+			post_alloc_hook(page, order, __GFP_MOVABLE);
+		}
+
+		pr_debug("releasing order-%d page", order);
+		__free_pages(page, order);
+
 		if (pfn > high_pfn)
 			high_pfn = pfn;
 	}
@@ -145,6 +154,10 @@ void __ClearPageMovable(struct page *page)
 	page->mapping = (void *)PAGE_MAPPING_MOVABLE;
 }
 EXPORT_SYMBOL(__ClearPageMovable);
+
+#ifdef CONFIG_COALAPAGING
+#include "coalapaging/compaction.h"
+#endif /* CONFIG_COALAPAGING */
 
 /* Do not skip compaction more than 64 times */
 #define COMPACT_MAX_DEFER_SHIFT 6
@@ -739,7 +752,7 @@ isolate_freepages_range(struct compact_control *cc,
 
 	if (pfn < end_pfn) {
 		/* Loop terminated early, cleanup. */
-		release_freepages(&freelist);
+		release_freepages(&freelist, false);
 		return 0;
 	}
 
@@ -987,6 +1000,17 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
 				low_pfn += (1UL << order) - 1;
 			goto isolate_fail;
 		}
+
+#ifdef CONFIG_COALAPAGING
+		if (PageLeshy(page)) {
+			const unsigned int order = compound_order(page);
+
+			pr_debug("skipping page leshy");
+			if (likely(order < MAX_ORDER))
+				low_pfn += (1UL << order) - 1;
+			goto isolate_fail;
+		}
+#endif /* CONFIG_COALAPAGING */
 
 		/*
 		 * Check may be lockless but that's ok as we recheck later.
@@ -1694,6 +1718,9 @@ static void isolate_freepages(struct compact_control *cc)
 
 splitmap:
 	/* __isolate_free_page() does not map the pages */
+#ifdef CONFIG_COALAPAGING
+	if (!is_via_etreclaim(cc->gfp_mask))
+#endif /* CONFIG_COALAPAGING */
 	split_map_pages(freelist);
 }
 
@@ -1710,9 +1737,17 @@ static struct page *compaction_alloc(struct page *migratepage,
 	if (list_empty(&cc->freepages)) {
 		isolate_freepages(cc);
 
-		if (list_empty(&cc->freepages))
+		if (list_empty(&cc->freepages)) {
+			pr_debug("empty freepages!");
 			return NULL;
+		}
 	}
+
+#ifdef CONFIG_COALAPAGING
+	if (is_via_etreclaim(cc->gfp_mask)) {
+		return etreclaim_alloc(migratepage, cc);
+	}
+#endif /* CONFIG_COALAPAGING */
 
 	freepage = list_entry(cc->freepages.next, struct page, lru);
 	list_del(&freepage->lru);
@@ -1730,16 +1765,24 @@ static void compaction_free(struct page *page, unsigned long data)
 {
 	struct compact_control *cc = (struct compact_control *)data;
 
+#ifdef CONFIG_COALAPAGING
+	if (is_via_etreclaim(cc->gfp_mask)) {
+		return etreclaim_free(page, cc);
+	}
+#endif /* CONFIG_COALAPAGING */
+
 	list_add(&page->lru, &cc->freepages);
 	cc->nr_freepages++;
 }
 
+#ifndef CONFIG_COALAPAGING
 /* possible outcome of isolate_migratepages */
 typedef enum {
 	ISOLATE_ABORT,		/* Abort compaction now */
 	ISOLATE_NONE,		/* No pages isolated, continue scanning */
 	ISOLATE_SUCCESS,	/* Pages isolated, migrate */
 } isolate_migrate_t;
+#endif
 
 /*
  * Allow userspace to control policy on scanning the unevictable LRU for
@@ -1902,6 +1945,12 @@ static isolate_migrate_t isolate_migratepages(struct compact_control *cc)
 		(sysctl_compact_unevictable_allowed ? ISOLATE_UNEVICTABLE : 0) |
 		(cc->mode != MIGRATE_SYNC ? ISOLATE_ASYNC_MIGRATE : 0);
 	bool fast_find_block;
+
+#ifdef CONFIG_COALAPAGING
+	if (is_via_etreclaim(cc->gfp_mask)) {
+		return etreclaim_isolate_migratepages(cc);
+	}
+#endif /* CONFIG_COALAPAGING */
 
 	/*
 	 * Start at where we last stopped, or beginning of the zone as
@@ -2326,6 +2375,18 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
 	unsigned int nr_succeeded = 0;
 	long vendor_ret;
 
+#ifdef CONFIG_COALAPAGING
+	if (is_via_etreclaim(cc->gfp_mask)) {
+		cc->order = MAX_ORDER - 1;
+		cc->search_order = MAX_ORDER - 1;
+		cc->mode = MIGRATE_SYNC;
+		cc->ignore_skip_hint = true;
+		cc->no_set_skip_hint = true;
+		cc->whole_zone = true;
+		cc->direct_compaction = true;
+	}
+#endif /* CONFIG_COALAPAGING */
+
 	/*
 	 * These counters track activities during zone compaction.  Initialize
 	 * them before compacting a new zone.
@@ -2337,7 +2398,17 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
 	INIT_LIST_HEAD(&cc->freepages);
 	INIT_LIST_HEAD(&cc->migratepages);
 
+	cc->nr_isofreepages = 0;
+	INIT_LIST_HEAD(&cc->isofreepages);
+
 	cc->migratetype = gfp_migratetype(cc->gfp_mask);
+
+#ifdef CONFIG_COALAPAGING
+	if (is_via_etreclaim(cc->gfp_mask)) {
+		goto skip_checks;
+	}
+#endif /* CONFIG_COALAPAGING */
+
 	ret = compaction_suitable(cc->zone, cc->order, cc->alloc_flags,
 							cc->highest_zoneidx);
 	/* Compaction is likely to fail */
@@ -2354,6 +2425,9 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
 	if (compaction_restarting(cc->zone, cc->order))
 		__reset_isolation_suitable(cc->zone);
 
+#ifdef CONFIG_COALAPAGING
+skip_checks:
+#endif /* CONFIG_COALAPAGING */
 	/*
 	 * Setup to move all movable pages to the end of the zone. Used cached
 	 * information on where the scanners should start (unless we explicitly
@@ -2423,6 +2497,9 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
 			ret = COMPACT_CONTENDED;
 			putback_movable_pages(&cc->migratepages);
 			cc->nr_migratepages = 0;
+#ifdef CONFIG_COALAPAGING
+			etreclaim_putback_free(cc);
+#endif /* CONFIG_COALAPAGING */
 			goto out;
 		case ISOLATE_NONE:
 			if (update_cached) {
@@ -2443,9 +2520,30 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
 
 		err = migrate_pages(&cc->migratepages, compaction_alloc,
 				compaction_free, (unsigned long)cc, cc->mode,
+#ifdef CONFIG_COALAPAGING
+				is_via_etreclaim(cc->gfp_mask) ? MR_ETCOMPACTION : MR_COMPACTION, &nr_succeeded);
+#else /* !CONFIG_COALAPAGING */
 				MR_COMPACTION, &nr_succeeded);
+#endif
 
 		trace_mm_compaction_migratepages(cc, nr_succeeded);
+
+#ifdef CONFIG_COALAPAGING
+		if (is_via_etreclaim(cc->gfp_mask)) {
+			//if (!err) {
+			if (nr_succeeded == 8192) {
+				if (err) {
+					pr_debug("WTF err mig!!!");
+				}
+				err = 0;
+				etreclaim_finish_compact(cc);
+			} else {
+				pr_debug("migrate %d %u", err, nr_succeeded);
+				putback_movable_pages(&cc->migratepages);
+				etreclaim_putback_free(cc);
+			}
+		}
+#endif /* CONFIG_COALAPAGING */
 
 		/* All pages were either migrated or will be released */
 		cc->nr_migratepages = 0;
@@ -2499,12 +2597,28 @@ check_drain:
 	}
 
 out:
+#ifdef CONFIG_COALAPAGING
+	if (is_via_etreclaim(cc->gfp_mask)) {
+		putback_movable_pages(&cc->migratepages);
+		etreclaim_putback_free(cc);
+		release_freepages(&cc->freepages, true);
+		cc->nr_freepages = 0;
+		cc->nr_migratepages = 0;
+		cc->nr_isofreepages = 0;
+	}
+#endif /* CONFIG_COALAPAGING */
+
 	/*
 	 * Release free pages and update where the free scanner should restart,
 	 * so we don't leave any returned pages behind in the next attempt.
 	 */
 	if (cc->nr_freepages > 0) {
-		unsigned long free_pfn = release_freepages(&cc->freepages);
+#ifdef CONFIG_COALAPAGING
+		unsigned long free_pfn = release_freepages(&cc->freepages, is_via_etreclaim(cc->gfp_mask));
+#else
+		unsigned long free_pfn = release_freepages(&cc->freepages, false);
+#endif
+
 
 		cc->nr_freepages = 0;
 		VM_BUG_ON(free_pfn == 0);
@@ -2604,15 +2718,35 @@ enum compact_result try_to_compact_pages(gfp_t gfp_mask, unsigned int order,
 	struct zoneref *z;
 	struct zone *zone;
 	enum compact_result rc = COMPACT_SKIPPED;
+#ifdef CONFIG_COALAPAGING
+	struct zonelist *zlist = ac->zonelist;
+	nodemask_t *nmask = ac->nodemask;
+#endif /* CONFIG_COALAPAGING */
 
 	if (!gfp_compaction_allowed(gfp_mask))
 		return COMPACT_SKIPPED;
 
+#ifdef CONFIG_COALAPAGING
+	if (is_via_etreclaim(gfp_mask)) {
+		order = MAX_ORDER - 1;
+		prio = MIN_COMPACT_PRIORITY;
+		//prio = COMPACT_PRIO_SYNC_LIGHT;
+		zlist = node_zonelist(0, gfp_mask);
+		__nodes_clear(nmask, MAX_NUMNODES);
+		__node_set(0, nmask);
+	}
+#endif /* CONFIG_COALAPAGING */
+	
 	trace_mm_compaction_try_to_compact_pages(order, gfp_mask, prio);
 
 	/* Compact each zone in the list */
+#ifdef CONFIG_COALAPAGING
+	for_each_zone_zonelist_nodemask(zone, z, zlist,
+					ac->highest_zoneidx, nmask) {
+#else /* !CONFIG_COALAPAGING */
 	for_each_zone_zonelist_nodemask(zone, z, ac->zonelist,
 					ac->highest_zoneidx, ac->nodemask) {
+#endif /* CONFIG_COALAPAGING */
 		enum compact_result status;
 
 		if (prio > MIN_COMPACT_PRIORITY
@@ -2942,6 +3076,8 @@ void wakeup_kcompactd(pg_data_t *pgdat, int order, int highest_zoneidx)
 	wake_up_interruptible(&pgdat->kcompactd_wait);
 }
 
+extern bool kcompactd_enable;
+
 /*
  * The background compaction daemon, started as a kernel thread
  * from the init process.
@@ -2965,6 +3101,14 @@ static int kcompactd(void *p)
 
 	while (!kthread_should_stop()) {
 		unsigned long pflags;
+
+		if (!kcompactd_enable) {
+			pgdat->proactive_compact_trigger = false;
+			timeout = default_timeout;
+			wait_event_freezable_timeout(pgdat->kcompactd_wait,
+					kcompactd_enable, timeout);
+			continue;
+		}
 
 		/*
 		 * Avoid the unnecessary wakeup for proactive compaction

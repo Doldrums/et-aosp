@@ -112,6 +112,11 @@
 
 #undef CREATE_TRACE_POINTS
 #include <trace/hooks/sched.h>
+
+#ifdef CONFIG_COALAPAGING
+#include <linux/coalapaging.h>
+#endif /* CONFIG_COALAPAGING */
+
 /*
  * Minimum number of threads to boot the kernel
  */
@@ -887,6 +892,15 @@ void __mmdrop(struct mm_struct *mm)
 	check_mm(mm);
 	put_user_ns(mm->user_ns);
 	mm_pasid_drop(mm);
+
+#ifdef CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS
+if (mm->ebc)
+	kfree(mm->ebc);
+#endif /* CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS */
+
+#ifdef CONFIG_COALAPAGING
+coala_drop_hints(mm);
+#endif /* CONFIG_COALAPAGING */
 	free_mm(mm);
 }
 EXPORT_SYMBOL_GPL(__mmdrop);
@@ -1254,6 +1268,11 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 		mm->flags = default_dump_filter;
 		mm->def_flags = 0;
 	}
+
+#ifdef CONFIG_COALAPAGING
+	if (coala_init_hints(mm) < 0)
+		goto fail_nopgd;
+#endif /* CONFIG_COALAPAGING */
 
 	if (mm_alloc_pgd(mm))
 		goto fail_nopgd;
@@ -1638,6 +1657,10 @@ static struct mm_struct *dup_mm(struct task_struct *tsk,
 	if (!mm_init(mm, tsk, mm->user_ns))
 		goto fail_nomem;
 
+#ifdef CONFIG_COALAPAGING
+	coala_dup_hints(mm, oldmm);
+#endif /* CONFIG_COALAPAGING */
+	
 	err = dup_mmap(mm, oldmm);
 	if (err)
 		goto free_pt;
@@ -1648,6 +1671,11 @@ static struct mm_struct *dup_mm(struct task_struct *tsk,
 	if (mm->binfmt && !try_module_get(mm->binfmt->module))
 		goto free_pt;
 
+#ifdef CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS
+	if (oldmm->ebc)
+		mm->ebc = kzalloc(sizeof(struct et_batch), GFP_KERNEL);
+#endif /* CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS */
+	
 	return mm;
 
 free_pt:

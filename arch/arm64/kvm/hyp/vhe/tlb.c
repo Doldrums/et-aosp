@@ -161,3 +161,35 @@ void __kvm_flush_vm_context(void)
 
 	dsb(ish);
 }
+
+#ifdef CONFIG_ARM64_ELASTIC_TRANSLATIONS
+void __kvm_tlb_flush_range(struct kvm_s2_mmu *mmu, phys_addr_t ipa, int level)
+{
+	int i;
+	unsigned long entries = CONT_PTES, stride = 1;
+	struct tlb_inv_context cxt;
+
+	if (level == KVM_PGTABLE_MAX_LEVELS - 2) {
+		entries = CONT_PMDS;
+		stride = 1UL << (PMD_SHIFT - PAGE_SHIFT);
+	}
+
+	dsb(ishst);
+
+	/* Switch to requested VMID */
+	__tlb_switch_to_guest(mmu, &cxt);
+
+	ipa = ALIGN_DOWN(ipa >> PAGE_SHIFT, entries * stride);
+	for (i = 0; i < entries; i++, ipa += stride) {
+		pr_debug("Flushing 0x%llx", ipa);
+		__tlbi_level(ipas2e1is, ipa, level);
+	}
+
+	dsb(ish);
+	__tlbi(vmalle1is);
+	dsb(ish);
+	isb();
+
+	__tlb_switch_to_host(&cxt);
+}
+#endif /* CONFIG_ARM64_ELASTIC_TRANSLATIONS */

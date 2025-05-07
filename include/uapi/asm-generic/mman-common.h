@@ -77,7 +77,15 @@
 
 #define MADV_DONTNEED_LOCKED	24	/* like DONTNEED, but drop locked pages too */
 
-#define MADV_COLLAPSE	25		/* Synchronous hugepage collapse */
+#define MADV_ELASTIC	225	/* Enable Elastic Translations for this VMA */
+
+#define MADV_COALA	226	/* Enable COALAPaging for this VMA */
+#define MADV_COALA_HINT_64K	227
+#define MADV_COALA_HINT_2M	228
+#define MADV_COALA_HINT_32M	229
+#define MADV_COALA_HINT_KHUGE 230
+
+#define MADV_COLLAPSE 25		/* Synchronous hugepage collapse */
 
 /* compatibility flags */
 #define MAP_FILE	0

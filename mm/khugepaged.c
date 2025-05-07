@@ -25,6 +25,11 @@
 #include "internal.h"
 #include "mm_slot.h"
 
+#ifdef CONFIG_COALAPAGING
+#include "coalapaging/internal.h"
+#include <linux/coalapaging.h>
+#endif /* CONFIG_COALAPAGING */
+
 enum scan_result {
 	SCAN_FAIL,
 	SCAN_SUCCEED,
@@ -84,6 +89,8 @@ static unsigned int khugepaged_max_ptes_none __read_mostly;
 static unsigned int khugepaged_max_ptes_swap __read_mostly;
 static unsigned int khugepaged_max_ptes_shared __read_mostly;
 
+bool kcompactd_enable __read_mostly = true;
+
 #define MM_SLOTS_HASH_BITS 10
 static __read_mostly DEFINE_HASHTABLE(mm_slots_hash, MM_SLOTS_HASH_BITS);
 
@@ -113,6 +120,7 @@ struct khugepaged_mm_slot {
 	/* pte-mapped THP in this mm */
 	int nr_pte_mapped_thp;
 	unsigned long pte_mapped_thp[MAX_PTE_MAPPED_THP];
+	unsigned long address;
 };
 
 /**
@@ -218,8 +226,25 @@ static ssize_t pages_collapsed_show(struct kobject *kobj,
 {
 	return sysfs_emit(buf, "%u\n", khugepaged_pages_collapsed);
 }
+
+static ssize_t pages_collapsed_store(struct kobject *kobj,
+	struct kobj_attribute *attr,
+	const char *buf, size_t count)
+{
+unsigned int pages;
+int err;
+
+err = kstrtouint(buf, 10, &pages);
+if (err || pages)
+return -EINVAL;
+
+khugepaged_pages_collapsed = 0;
+
+return count;
+}
+
 static struct kobj_attribute pages_collapsed_attr =
-	__ATTR_RO(pages_collapsed);
+__ATTR(pages_collapsed, 0644, pages_collapsed_show, pages_collapsed_store);
 
 static ssize_t full_scans_show(struct kobject *kobj,
 			       struct kobj_attribute *attr,
@@ -227,8 +252,24 @@ static ssize_t full_scans_show(struct kobject *kobj,
 {
 	return sysfs_emit(buf, "%u\n", khugepaged_full_scans);
 }
+static ssize_t full_scans_store(struct kobject *kobj,
+	struct kobj_attribute *attr,
+	const char *buf, size_t count)
+{
+	unsigned int pages;
+	int err;
+
+	err = kstrtouint(buf, 10, &pages);
+	if (err || pages)
+	return -EINVAL;
+
+	khugepaged_full_scans = 0;
+
+	return count;
+}
 static struct kobj_attribute full_scans_attr =
-	__ATTR_RO(full_scans);
+__ATTR(full_scans, 0644, full_scans_show,
+	full_scans_store);
 
 static ssize_t defrag_show(struct kobject *kobj,
 			   struct kobj_attribute *attr, char *buf)
@@ -573,6 +614,21 @@ static int __collapse_huge_page_isolate(struct vm_area_struct *vma,
 
 		VM_BUG_ON_PAGE(!PageAnon(page), page);
 
+		#ifdef CONFIG_COALAPAGING
+		if (coala_hints_enabled(vma->vm_mm) && pte_cont(pteval)) {
+			struct coala_hint hint; 
+
+			hint = coala_get_hint(vma->vm_mm, address);
+			
+			if (hint.val == COALA_HINT_64K) {
+				pr_crit("wtf isolate cont");
+				coala_clear_khugepaged_mark(vma->vm_mm, address,
+						COALA_HINT_64K); 
+				goto out;
+			}
+		}
+		#endif /* CONFIG_COALAPAGING */
+
 		if (page_mapcount(page) > 1) {
 			++shared;
 			if (cc->is_khugepaged &&
@@ -652,6 +708,13 @@ next:
 		     PageReferenced(page) || mmu_notifier_test_young(vma->vm_mm,
 								     address)))
 			referenced++;
+
+	#ifdef CONFIG_COALAPAGING
+		if (coala_hints_enabled(vma->vm_mm)) {
+			referenced++;
+		}
+	#endif /* CONFIG_COALAPAGING */
+	
 
 		if (pte_write(pteval))
 			writable = true;
@@ -1121,6 +1184,18 @@ static int collapse_huge_page(struct mm_struct *mm, unsigned long address,
 
 	hpage = NULL;
 
+	#ifdef CONFIG_COALAPAGING
+	if (coala_hints_enabled(vma->vm_mm)) {
+		coala_clear_khugepaged_mark(vma->vm_mm, address, COALA_HINT_2M);
+	}
+
+	if (!coala_hints_enabled(vma->vm_mm) || coala_get_hint(vma->vm_mm, address).val == ULONG_MAX) {
+		pr_debug("increasing collapsed!");
+	} else {
+		pr_debug("coala 2m increased collapsed!");
+	}
+	#endif /* CONFIG_COALAPAGING */
+
 	result = SCAN_SUCCEED;
 out_up_write:
 	mmap_write_unlock(mm);
@@ -1132,6 +1207,10 @@ out_nolock:
 	trace_mm_collapse_huge_page(mm, result == SCAN_SUCCEED, result);
 	return result;
 }
+
+#ifdef CONFIG_COALAPAGING
+#include "coalapaging/khugepaged.h"
+#endif /* CONFIG_COALAPAGING */
 
 static int hpage_collapse_scan_pmd(struct mm_struct *mm,
 				   struct vm_area_struct *vma,
@@ -1208,6 +1287,21 @@ static int hpage_collapse_scan_pmd(struct mm_struct *mm,
 		if (pte_write(pteval))
 			writable = true;
 
+	#ifdef CONFIG_COALAPAGING
+		if (coala_hints_enabled(vma->vm_mm) && pte_cont(pteval)) {
+			struct coala_hint hint;
+
+			hint = coala_get_hint(vma->vm_mm, address);
+			
+			if (hint.val == COALA_HINT_64K) {
+				pr_crit("wtf isolate cont 2");
+				coala_clear_khugepaged_mark(vma->vm_mm, _address,
+						COALA_HINT_64K); 
+				goto out_unmap;
+			}
+		}
+	#endif /* CONFIG_COALAPAGING */
+	
 		page = vm_normal_page(vma, _address, pteval);
 		if (unlikely(!page) || unlikely(is_zone_device_page(page))) {
 			result = SCAN_PAGE_NULL;
@@ -1282,6 +1376,12 @@ static int hpage_collapse_scan_pmd(struct mm_struct *mm,
 		     PageReferenced(page) || mmu_notifier_test_young(vma->vm_mm,
 								     address)))
 			referenced++;
+
+#ifdef CONFIG_COALAPAGING
+		if (coala_hints_enabled(vma->vm_mm)) {
+			referenced++;
+		}
+#endif /* CONFIG_COALAPAGING */
 	}
 	if (!writable) {
 		result = SCAN_PAGE_RO;
@@ -1294,6 +1394,17 @@ static int hpage_collapse_scan_pmd(struct mm_struct *mm,
 	}
 out_unmap:
 	pte_unmap_unlock(pte, ptl);
+
+#ifdef CONFIG_COALAPAGING
+	if (!result && (hpage == COALA_SCANONLY || coala_get_hint(mm, address).val == COALA_HINT_32M)) {
+		pr_debug("2m collapse failed with %d", result);
+	}
+
+	if (hpage == COALA_SCANONLY) {
+		return result;
+	}
+#endif /* CONFIG_COALAPAGING */
+
 	if (result == SCAN_SUCCEED) {
 		result = collapse_huge_page(mm, address, referenced,
 					    unmapped, cc);
@@ -2273,6 +2384,7 @@ static unsigned int khugepaged_scan_mm_slot(unsigned int pages, int *result,
 	struct mm_struct *mm;
 	struct vm_area_struct *vma;
 	int progress = 0;
+	unsigned long nr = 1;
 
 	VM_BUG_ON(!pages);
 	lockdep_assert_held(&khugepaged_mm_lock);
@@ -2285,18 +2397,66 @@ static unsigned int khugepaged_scan_mm_slot(unsigned int pages, int *result,
 		slot = list_entry(khugepaged_scan.mm_head.next,
 				     struct mm_slot, mm_node);
 		mm_slot = mm_slot_entry(slot, struct khugepaged_mm_slot, slot);
-		khugepaged_scan.address = 0;
 		khugepaged_scan.mm_slot = mm_slot;
 	}
+	
+	khugepaged_scan.address = mm_slot->address;
 	spin_unlock(&khugepaged_mm_lock);
 	khugepaged_collapse_pte_mapped_thps(mm_slot);
 
+	vma = NULL;
 	mm = slot->mm;
+
+#ifdef CONFIG_COALAPAGING
+	if (coala_khugepaged_skip_mm(mm)) {
+		goto breakouterloop_mmap_lock;
+	}
+
+	if (mm->owner && mm->owner->comm) {
+		pr_debug("mm 0x%lx (%s), addr: 0x%lx", (unsigned long)mm, mm->owner->comm,
+				khugepaged_scan.address);
+	}
+
+	if (coala_hints_enabled(mm) &&
+		(!coala_khuge_fallback || coala_hints_khuge(mm))) {
+		bool ret;
+		struct timespec64 t0, t1;
+
+		ktime_get_ts64(&t0);
+		ret = coala_khugepaged_scan_mm(mm, &vma, pages, hpage, &progress);
+		ktime_get_ts64(&t1);
+
+		pr_debug("promotion time: %lld msecs",
+				(t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000);
+
+		if (ret) {
+			if (progress < pages) {
+				pr_debug("coala fallback 1 0x%lx", (unsigned long)mm);
+				goto fallback;
+			}
+			goto breakouterloop;
+		} else {
+			goto breakouterloop_mmap_lock;
+		}
+	}
+
+	if (mm->owner && mm->owner->comm) {
+		if (mm->et_enabled) {
+			if (coala_hints_enabled(mm)) {
+				pr_debug("coala fallback 0x%lx %s", (unsigned long)mm, mm->owner->comm);
+			} else {
+				pr_debug("coala etheap async 0x%lx %s", (unsigned long)mm, mm->owner->comm);
+			}
+		} else {
+			pr_debug("noncoala 0x%lx %s", (unsigned long)mm, mm->owner->comm);
+		}
+	}
+#endif /* CONFIG_COALAPAGING */
+
 	/*
 	 * Don't wait for semaphore (to avoid long wait times).  Just move to
 	 * the next mm on the list.
 	 */
-	vma = NULL;
 	if (unlikely(!mmap_read_trylock(mm)))
 		goto breakouterloop_mmap_lock;
 
@@ -2348,10 +2508,52 @@ skip:
 				mmap_locked = false;
 				fput(file);
 			} else {
+#ifdef CONFIG_COALAPAGING
+				if (!coala_hints_enabled(mm)) {
+					result = 0;
+					if (coala_khuge_etheap_async && mm->et_enabled &&
+						IS_ALIGNED(khugepaged_scan.address, CONT_PMD_SIZE)) {
+						bool cont = false;
+						pr_debug("etheap: trying to promote 0x%lx",
+								khugepaged_scan.address);
+								result = coala_khugepaged_scan_contpmd(mm, vma, 
+								khugepaged_scan.address, hpage, &cont);
+						if (cont) {
+							pr_debug("0x%lx already cont",
+									khugepaged_scan.address);
+						}
+						nr = CONT_PMDS;
+
+						if (!IS_ERR_OR_NULL(*hpage)) {
+							pr_info("freeing contpmd page");
+							coala_khugepaged_free(*hpage);
+							*hpage = NULL;
+						}
+					}
+
+					if (!result) {
+						*result = hpage_collapse_scan_pmd(mm, vma,
+											khugepaged_scan.address,
+											&mmap_locked,
+											cc);
+						nr = 1;
+					}
+				} else {
+					struct coala_hint hint; 
+					hint = coala_get_hint(vma->vm_mm, khugepaged_scan.address);
+					if ((hint.val != ULONG_MAX) && (hint.val < COALA_HINT_64K)) {
+						*result = hpage_collapse_scan_pmd(mm, vma,
+							khugepaged_scan.address,
+							&mmap_locked,
+							cc);
+					}
+				}
+#else /* CONFIG_COALAPAGING */
 				*result = hpage_collapse_scan_pmd(mm, vma,
-								  khugepaged_scan.address,
-								  &mmap_locked,
-								  cc);
+					khugepaged_scan.address,
+					&mmap_locked,
+					cc);
+#endif /* CONFIG_COALAPAGING */
 			}
 			switch (*result) {
 			case SCAN_PTE_MAPPED_HUGEPAGE: {
@@ -2374,7 +2576,7 @@ skip:
 			}
 
 			/* move to next address */
-			khugepaged_scan.address += HPAGE_PMD_SIZE;
+			khugepaged_scan.address += nr * HPAGE_PMD_SIZE;
 			progress += HPAGE_PMD_NR;
 			if (!mmap_locked)
 				/*
@@ -2385,6 +2587,13 @@ skip:
 				 * correct result back to caller.
 				 */
 				goto breakouterloop_mmap_lock;
+
+#ifdef CONFIG_COALAPAGING
+			if (mm->et_enabled) {
+				pr_debug("progress: %d, next: 0x%lx", progress,
+						khugepaged_scan.address);
+			}
+#endif
 			if (progress >= pages)
 				goto breakouterloop;
 		}
@@ -2395,11 +2604,21 @@ breakouterloop_mmap_lock:
 
 	spin_lock(&khugepaged_mm_lock);
 	VM_BUG_ON(khugepaged_scan.mm_slot != mm_slot);
+	mm_slot->address = khugepaged_scan.address;
+
 	/*
 	 * Release the current mm_slot if this mm is about to die, or
 	 * if we scanned all vmas of this mm.
 	 */
+#ifdef CONFIG_COALAPAGING
+	if (hpage_collapse_test_exit(mm) || !vma || coala_khuge_rr) {
+#else
 	if (hpage_collapse_test_exit(mm) || !vma) {
+#endif
+		if (!vma) {
+			mm_slot->address = 0;
+		}
+
 		/*
 		 * Make sure that if mm_users is reaching zero while
 		 * khugepaged runs here, khugepaged_exit will find
@@ -2410,7 +2629,6 @@ breakouterloop_mmap_lock:
 					  struct mm_slot, mm_node);
 			khugepaged_scan.mm_slot =
 				mm_slot_entry(slot, struct khugepaged_mm_slot, slot);
-			khugepaged_scan.address = 0;
 		} else {
 			khugepaged_scan.mm_slot = NULL;
 			khugepaged_full_scans++;

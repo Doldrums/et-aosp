@@ -93,7 +93,11 @@ static inline pteval_t __phys_to_pte_val(phys_addr_t phys)
 	__pte(__phys_to_pte_val((phys_addr_t)(pfn) << PAGE_SHIFT) | pgprot_val(prot))
 
 #define pte_none(pte)		(!pte_val(pte))
-#define pte_clear(mm,addr,ptep)	set_pte(ptep, __pte(0))
+#ifdef CONFIG_ARM64_ELASTIC_TRANSLATIONS
+#define pte_clear(mm,addr,ptep)        set_pte_at(mm, addr, ptep, __pte(0))
+#else
+#define pte_clear(mm,addr,ptep)        set_pte(ptep, __pte(0))
+#endif /* CONFIG_ARM64_ELASTIC_TRANSLATIONS */
 #define pte_page(pte)		(pfn_to_page(pte_pfn(pte)))
 
 /*
@@ -322,9 +326,24 @@ static inline void __check_racy_pte_update(struct mm_struct *mm, pte_t *ptep,
 
 #include <asm/android_erratum_pgtable.h>
 
-static inline void __set_pte_at(struct mm_struct *mm, unsigned long addr,
-				pte_t *ptep, pte_t pte)
+#ifdef CONFIG_ARM64_ELASTIC_TRANSLATIONS
+#include <asm/et.h>
+#endif /* CONFIG_ARM64_ELASTIC_TRANSLATIONS */
+
+#ifdef CONFIG_PFTRACE
+#include <linux/tracepoint-defs.h>
+
+DECLARE_TRACEPOINT(setpte);
+void do_trace_setpte(unsigned long cycles);
+#endif /* CONFIG_PFTRACE */
+
+static inline void __set_entry_at(struct mm_struct *mm, unsigned long addr,
+				pte_t *ptep, pte_t pte, bool et, bool is_pmd)
 {
+#ifdef CONFIG_PFTRACE
+	unsigned long cycles = get_cycles();
+#endif /* CONFIG_PFTRACE */
+
 	if (pte_present(pte) && pte_user_exec(pte) && !pte_special(pte))
 		__sync_icache_dcache(pte);
 
@@ -340,15 +359,42 @@ static inline void __set_pte_at(struct mm_struct *mm, unsigned long addr,
 
 	__check_racy_pte_update(mm, ptep, pte);
 
+#ifdef CONFIG_ARM64_ELASTIC_TRANSLATIONS
+	if (et && is_et_enabled(mm)) {
+		struct et_ctx ctx = {
+			.mm = mm,
+			.addr = addr,
+			.ptep = ptep,
+			.pte = pte,
+			.level = is_pmd ? ET_PMD : ET_PTE,
+		};
+		et_set_entry_at(&ctx);
+
+#ifdef CONFIG_PFTRACE
+		if (tracepoint_enabled(setpte)) {
+			do_trace_setpte(get_cycles() - cycles);
+		}
+#endif /* CONFIG_PFTRACE */
+
+		return;
+	}
+#else /* !CONFIG_ARM64_ELASTIC_TRANSLATIONS */
 	arm64_update_cacheable_aliases(ptep, pte);
+#endif /* CONFIG_ARM64_ELASTIC_TRANSLATIONS */
 	set_pte(ptep, pte);
+#ifdef CONFIG_PFTRACE
+	if (tracepoint_enabled(setpte)) {
+		do_trace_setpte(get_cycles() - cycles);
+	}
+#endif /* CONFIG_PFTRACE */
 }
 
 static inline void set_pte_at(struct mm_struct *mm, unsigned long addr,
 			      pte_t *ptep, pte_t pte)
 {
 	page_table_check_pte_set(mm, addr, ptep, pte);
-	return __set_pte_at(mm, addr, ptep, pte);
+
+	return __set_entry_at(mm, addr, ptep, pte, true, false);
 }
 
 /*
@@ -526,7 +572,7 @@ static inline void set_pmd_at(struct mm_struct *mm, unsigned long addr,
 {
 	WARN_ON(prot_needs_stage2_update(__pgprot(pmd_val(pmd))));
 	page_table_check_pmd_set(mm, addr, pmdp, pmd);
-	return __set_pte_at(mm, addr, (pte_t *)pmdp, pmd_pte(pmd));
+	return __set_entry_at(mm, addr, (pte_t *)pmdp, pmd_pte(pmd), true, true);
 }
 
 static inline void set_pud_at(struct mm_struct *mm, unsigned long addr,
@@ -534,7 +580,7 @@ static inline void set_pud_at(struct mm_struct *mm, unsigned long addr,
 {
 	WARN_ON(prot_needs_stage2_update(__pgprot(pud_val(pud))));
 	page_table_check_pud_set(mm, addr, pudp, pud);
-	return __set_pte_at(mm, addr, (pte_t *)pudp, pud_pte(pud));
+	return __set_entry_at(mm, addr, (pte_t *)pudp, pud_pte(pud), false, false);
 }
 
 #define __p4d_to_phys(p4d)	__pte_to_phys(p4d_pte(p4d))
@@ -841,6 +887,9 @@ static inline pmd_t pmd_modify(pmd_t pmd, pgprot_t newprot)
 }
 
 #define __HAVE_ARCH_PTEP_SET_ACCESS_FLAGS
+extern int entry_set_access_flags(struct vm_area_struct *vma,
+	unsigned long address, pte_t *ptep,
+	pte_t entry, int dirty, bool is_pmd);
 extern int ptep_set_access_flags(struct vm_area_struct *vma,
 				 unsigned long address, pte_t *ptep,
 				 pte_t entry, int dirty);
@@ -851,7 +900,7 @@ static inline int pmdp_set_access_flags(struct vm_area_struct *vma,
 					unsigned long address, pmd_t *pmdp,
 					pmd_t entry, int dirty)
 {
-	return ptep_set_access_flags(vma, address, (pte_t *)pmdp, pmd_pte(entry), dirty);
+	return entry_set_access_flags(vma, address, (pte_t *)pmdp, pmd_pte(entry), dirty, true);
 }
 
 static inline int pud_devmap(pud_t pud)
@@ -941,12 +990,20 @@ static inline int pmdp_test_and_clear_young(struct vm_area_struct *vma,
 
 #define __HAVE_ARCH_PTEP_GET_AND_CLEAR
 static inline pte_t ptep_get_and_clear(struct mm_struct *mm,
-				       unsigned long address, pte_t *ptep)
+	unsigned long address, pte_t *ptep)
 {
 	pte_t pte;
 
-	arm64_update_cacheable_aliases(ptep, __pte(0));
-	pte = __pte(xchg_relaxed(&pte_val(*ptep), 0));
+#ifdef CONFIG_ARM64_ELASTIC_TRANSLATIONS
+	if (is_et_enabled(mm)) {
+		pte = READ_ONCE(*ptep);
+		set_pte_at(mm, address, ptep, __pte(0));
+	} else
+#endif
+	{
+		arm64_update_cacheable_aliases(ptep, __pte(0));
+		pte = __pte(xchg_relaxed(&pte_val(*ptep), 0));
+	}
 
 	page_table_check_pte_clear(mm, address, pte);
 
@@ -956,9 +1013,19 @@ static inline pte_t ptep_get_and_clear(struct mm_struct *mm,
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 #define __HAVE_ARCH_PMDP_HUGE_GET_AND_CLEAR
 static inline pmd_t pmdp_huge_get_and_clear(struct mm_struct *mm,
-					    unsigned long address, pmd_t *pmdp)
+						unsigned long address, pmd_t *pmdp)
 {
-	pmd_t pmd = __pmd(xchg_relaxed(&pmd_val(*pmdp), 0));
+	pmd_t pmd;
+
+#ifdef CONFIG_ARM64_ELASTIC_TRANSLATIONS
+	if (is_et_enabled(mm)) {
+		pmd = READ_ONCE(*pmdp);
+		set_pmd_at(mm, address, pmdp, __pmd(0));
+	} else
+#endif
+	{
+		pmd = __pmd(xchg_relaxed(&pmd_val(*pmdp), 0));
+	}
 
 	page_table_check_pmd_clear(mm, address, pmd);
 
@@ -971,10 +1038,17 @@ static inline pmd_t pmdp_huge_get_and_clear(struct mm_struct *mm,
  * dirty status (PTE_DBM && !PTE_RDONLY) to the software PTE_DIRTY bit.
  */
 #define __HAVE_ARCH_PTEP_SET_WRPROTECT
-static inline void ptep_set_wrprotect(struct mm_struct *mm, unsigned long address, pte_t *ptep)
+static inline void entry_set_wrprotect(struct mm_struct *mm, unsigned long address, pte_t *ptep, bool is_pmd)
 {
-	pte_t old_pte, pte;
+	pte_t old_pte, pte = __pte(0);
 
+#ifdef CONFIG_ARM64_ELASTIC_TRANSLATIONS
+	/* FIXME: Figure out how to handle HWAFDBM */
+	if (is_et_enabled(mm)) {
+		__set_entry_at(mm, address, ptep, pte_wrprotect(pte), true, is_pmd);
+		return;
+	}
+#endif /* CONFIG_ARM64_ELASTIC_TRANSLATIONS */
 	pte = READ_ONCE(*ptep);
 	do {
 		old_pte = pte;
@@ -984,12 +1058,17 @@ static inline void ptep_set_wrprotect(struct mm_struct *mm, unsigned long addres
 	} while (pte_val(pte) != pte_val(old_pte));
 }
 
+static inline void ptep_set_wrprotect(struct mm_struct *mm, unsigned long address, pte_t *ptep)
+{
+	entry_set_wrprotect(mm, address, ptep, false);
+}
+
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 #define __HAVE_ARCH_PMDP_SET_WRPROTECT
 static inline void pmdp_set_wrprotect(struct mm_struct *mm,
 				      unsigned long address, pmd_t *pmdp)
 {
-	ptep_set_wrprotect(mm, address, (pte_t *)pmdp);
+	entry_set_wrprotect(mm, address, (pte_t *)pmdp, true);
 }
 
 #define pmdp_establish pmdp_establish
@@ -997,6 +1076,14 @@ static inline pmd_t pmdp_establish(struct vm_area_struct *vma,
 		unsigned long address, pmd_t *pmdp, pmd_t pmd)
 {
 	page_table_check_pmd_set(vma->vm_mm, address, pmdp, pmd);
+#ifdef CONFIG_ARM64_ELASTIC_TRANSLATIONS
+	/* FIXME: */
+	if (vma && is_et_enabled(vma->vm_mm)) {
+		pmd_t pmdv = READ_ONCE(*pmdp);
+		set_pmd_at(vma->vm_mm, address, pmdp, pmd);
+		return pmdv;
+	}
+#endif /* CONFIG_ARM64_ELASTIC_TRANSLATIONS */
 	return __pmd(xchg_relaxed(&pmd_val(*pmdp), pmd_val(pmd)));
 }
 #endif

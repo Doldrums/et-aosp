@@ -214,6 +214,8 @@ enum kvm_pgtable_prot {
 	KVM_PGTABLE_PROT_SW1			= BIT(56),
 	KVM_PGTABLE_PROT_SW2			= BIT(57),
 	KVM_PGTABLE_PROT_SW3			= BIT(58),
+
+	KVM_PGTABLE_PROT_RANGEOP		= BIT(63),
 };
 
 #define KVM_PGTABLE_PROT_RW	(KVM_PGTABLE_PROT_R | KVM_PGTABLE_PROT_W)
@@ -585,7 +587,7 @@ kvm_pte_t kvm_pgtable_stage2_mkold(struct kvm_pgtable *pgt, u64 addr);
  * Return: 0 on success, negative error code on failure.
  */
 int kvm_pgtable_stage2_relax_perms(struct kvm_pgtable *pgt, u64 addr,
-				   enum kvm_pgtable_prot prot);
+				   enum kvm_pgtable_prot prot, u64 size);
 
 /**
  * kvm_pgtable_stage2_is_young() - Test whether a page-table entry has the
@@ -677,4 +679,21 @@ enum kvm_pgtable_prot kvm_pgtable_stage2_pte_prot(kvm_pte_t pte);
  *	   kvm_pgtable_prot format.
  */
 enum kvm_pgtable_prot kvm_pgtable_hyp_pte_prot(kvm_pte_t pte);
+
+#ifdef CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS
+/**
+ * kvm_pgtable_stage2_rangeop() - Promote / demote a mapping in a guest stage-2 page-table to a range.
+ * @pgt:	Page-table structure initialised by kvm_pgtable_stage2_init*().
+ * @addr:	Intermediate physical address at which to place the mapping.
+ * @len:	Size of the mapping.
+ * @create: True for promotions, false otherwise.
+ * The offset of @addr within a page is ignored, @size is rounded-up to
+ * the next page boundary and @phys is rounded-down to the previous page
+ * boundary.
+ *
+ * Return: 0 on success, negative error code on failure.
+ */
+int kvm_pgtable_stage2_rangeop(struct kvm_pgtable *pgt, u64 addr, u64 len,
+			   bool create);
+#endif /* CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS */
 #endif	/* __ARM64_KVM_PGTABLE_H__ */

@@ -404,6 +404,10 @@ extern int __mmu_notifier_test_young(struct mm_struct *mm,
 				     unsigned long address);
 extern void __mmu_notifier_change_pte(struct mm_struct *mm,
 				      unsigned long address, pte_t pte);
+#ifdef CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS
+extern void __mmu_notifier_change_range(struct mm_struct *mm,
+					unsigned long address, unsigned long len, pte_t pte);
+#endif /* CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS */
 extern int __mmu_notifier_invalidate_range_start(struct mmu_notifier_range *r);
 extern void __mmu_notifier_invalidate_range_end(struct mmu_notifier_range *r,
 				  bool only_end);
@@ -456,6 +460,15 @@ static inline void mmu_notifier_change_pte(struct mm_struct *mm,
 	if (mm_has_notifiers(mm))
 		__mmu_notifier_change_pte(mm, address, pte);
 }
+
+#ifdef CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS
+static inline void mmu_notifier_change_range(struct mm_struct *mm,
+					   unsigned long address, unsigned long len, pte_t pte)
+{
+	if (mm_has_notifiers(mm))
+		__mmu_notifier_change_range(mm, address, len, pte);
+}
+#endif /* CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS */
 
 static inline void
 mmu_notifier_invalidate_range_start(struct mmu_notifier_range *range)

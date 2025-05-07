@@ -1367,6 +1367,10 @@ struct pagemapread {
 #define PM_SOFT_DIRTY		BIT_ULL(55)
 #define PM_MMAP_EXCLUSIVE	BIT_ULL(56)
 #define PM_UFFD_WP		BIT_ULL(57)
+//#ifdef CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS
+#define PM_THP			BIT_ULL(59)
+#define PM_CONT			BIT_ULL(60)
+//#endif /* CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS */
 #define PM_FILE			BIT_ULL(61)
 #define PM_SWAP			BIT_ULL(62)
 #define PM_PRESENT		BIT_ULL(63)
@@ -1443,6 +1447,12 @@ static pagemap_entry_t pte_to_pagemap_entry(struct pagemapread *pm,
 			flags |= PM_SOFT_DIRTY;
 		if (pte_uffd_wp(pte))
 			flags |= PM_UFFD_WP;
+//#ifdef CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS
+		if (pte_cont(pte)) {
+			pr_debug("Found cont PTE entry %llx", pte_val(pte));
+			flags |= PM_CONT;
+		}
+//#endif /* CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS */
 	} else if (is_swap_pte(pte)) {
 		swp_entry_t entry;
 		if (pte_swp_soft_dirty(pte))
@@ -1504,6 +1514,10 @@ static int pagemap_pmd_range(pmd_t *pmdp, unsigned long addr, unsigned long end,
 		if (pmd_present(pmd)) {
 			page = pmd_page(pmd);
 
+//#ifdef CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS
+			flags |= PM_THP;
+//#endif /* CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS */
+
 			flags |= PM_PRESENT;
 			if (pmd_soft_dirty(pmd))
 				flags |= PM_SOFT_DIRTY;
@@ -1512,6 +1526,12 @@ static int pagemap_pmd_range(pmd_t *pmdp, unsigned long addr, unsigned long end,
 			if (pm->show_pfn)
 				frame = pmd_pfn(pmd) +
 					((addr & ~PMD_MASK) >> PAGE_SHIFT);
+//#ifdef CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS
+			if (pmd_cont(pmd)) {
+				pr_debug("Found cont PMD entry %llx", pmd_val(pmd));
+				flags |= PM_CONT;
+			}
+//#endif /* CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS */
 		}
 #ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION
 		else if (is_swap_pmd(pmd)) {

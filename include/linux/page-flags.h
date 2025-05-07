@@ -138,6 +138,10 @@ enum pageflags {
 #ifdef CONFIG_KASAN_HW_TAGS
 	PG_skip_kasan_poison,
 #endif
+#ifdef CONFIG_COALAPAGING
+	PG_pcplocked,
+	PG_leshy,
+#endif /* CONFIG_COALAPAGING */
 #ifdef CONFIG_64BIT
 	PG_oem_reserved_1,
 	PG_oem_reserved_2,
@@ -615,6 +619,13 @@ PAGEFLAG_FALSE(SkipKASanPoison, skip_kasan_poison)
  */
 __PAGEFLAG(Reported, reported, PF_NO_COMPOUND)
 
+#ifdef CONFIG_COALAPAGING
+PAGEFLAG(Pcplocked, pcplocked, PF_ANY)
+TESTSCFLAG(Pcplocked, pcplocked, PF_ANY)
+PAGEFLAG(Leshy, leshy, PF_ANY)
+TESTSCFLAG(Leshy, leshy, PF_ANY)
+#endif /* CONFIG_COALAPAGING */
+
 #ifdef CONFIG_MEMORY_HOTPLUG
 PAGEFLAG(VmemmapSelfHosted, vmemmap_self_hosted, PF_ANY)
 #else
@@ -954,6 +965,14 @@ static inline bool is_page_hwpoison(struct page *page)
 #define PG_table	0x00000200
 #define PG_guard	0x00000400
 
+#ifdef CONFIG_COALAPAGING
+/*
+ * page flag for free pages that are not part of the buddy allocator
+ * lists (and thus not marked as Buddy) but are part of the PCP caches
+ */
+#define PG_ca_pcp      0x00001000
+#endif /* CONFIG_COALAPAGING */
+
 #define PageType(page, flag)						\
 	((page->page_type & (PAGE_TYPE_BASE | flag)) == PAGE_TYPE_BASE)
 
@@ -978,6 +997,9 @@ static __always_inline void __ClearPage##uname(struct page *page)	\
 	page->page_type |= PG_##lname;					\
 }
 
+#ifdef CONFIG_COALAPAGING
+PAGE_TYPE_OPS(CaPcpFree, ca_pcp)
+#endif 
 /*
  * PageBuddy() indicates that the page is free and in the buddy system
  * (see mm/page_alloc.c).

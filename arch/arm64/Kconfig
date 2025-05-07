@@ -1325,6 +1325,16 @@ config CPU_LITTLE_ENDIAN
 
 endchoice
 
+config ARM64_ELASTIC_TRANSLATIONS
+	bool "ARM64 Elastic Translations"
+	default n
+	depends on COALAPAGING
+	select HAVE_ARCH_ELASTIC_TRANSLATIONS
+	help
+	  Say Y to enable the use of the contiguous translation descriptor bit
+	  in order transparently coalesce contiguous translation entries
+	  (PTEs, PMDs).
+
 config SCHED_MC
 	bool "Multi-core scheduler support"
 	help

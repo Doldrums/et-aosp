@@ -74,6 +74,10 @@
 
 #include <trace/events/sched.h>
 
+#ifdef CONFIG_COALAPAGING
+#include <linux/coalapaging.h>
+#endif
+
 static int bprm_creds_from_file(struct linux_binprm *bprm);
 
 int suid_dumpable = 0;
@@ -991,6 +995,22 @@ static int exec_mmap(struct mm_struct *mm)
 	/* Notify parent that we're no longer interested in the old VM */
 	tsk = current;
 	old_mm = current->mm;
+
+#ifdef CONFIG_COALAPAGING
+	if ((old_mm && old_mm->coalapaging)) {
+		mm->coalapaging = true;
+		coala_dup_hints(mm, old_mm);
+	}
+#endif /* CONFIG_COALAPAGING */
+
+#ifdef CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS
+	if ((old_mm && old_mm->et_enabled)) {
+		mm->et_enabled = true;
+		if (!mm->ebc)
+			mm->ebc = kzalloc(sizeof(*(mm->ebc)), GFP_KERNEL);
+	}
+#endif /* CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS */
+
 	exec_mm_release(tsk, old_mm);
 	if (old_mm)
 		sync_mm_rss(old_mm);

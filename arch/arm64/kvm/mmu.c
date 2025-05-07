@@ -22,6 +22,10 @@
 
 #include "trace.h"
 
+#ifdef CONFIG_ARM64_ELASTIC_TRANSLATIONS
+#include <asm/et.h>
+#endif /* CONFIG_ARM64_ELASTIC_TRANSLATIONS */
+
 static struct kvm_pgtable *hyp_pgtable;
 static DEFINE_MUTEX(kvm_hyp_pgd_mutex);
 
@@ -659,7 +663,7 @@ static struct kvm_pgtable_mm_ops kvm_user_mm_ops = {
 	.phys_to_virt		= kvm_host_va,
 };
 
-static int get_user_mapping_size(struct kvm *kvm, u64 addr)
+static int get_user_mapping_size(struct kvm *kvm, u64 addr, kvm_pte_t *pte)
 {
 	struct kvm_pgtable pgt = {
 		.pgd		= (kvm_pte_t *)kvm->mm->pgd,
@@ -669,7 +673,6 @@ static int get_user_mapping_size(struct kvm *kvm, u64 addr)
 		.mm_ops		= &kvm_user_mm_ops,
 	};
 	unsigned long flags;
-	kvm_pte_t pte = 0;	/* Keep GCC quiet... */
 	u32 level = ~0;
 	int ret;
 
@@ -679,7 +682,7 @@ static int get_user_mapping_size(struct kvm *kvm, u64 addr)
 	 * IPI-ing threads).
 	 */
 	local_irq_save(flags);
-	ret = kvm_pgtable_get_leaf(&pgt, addr, &pte, &level);
+	ret = kvm_pgtable_get_leaf(&pgt, addr, pte, &level);
 	local_irq_restore(flags);
 
 	if (ret)
@@ -693,7 +696,7 @@ static int get_user_mapping_size(struct kvm *kvm, u64 addr)
 		return -EFAULT;
 
 	/* Oops, the userspace PTs are gone... Replay the fault */
-	if (!kvm_pte_valid(pte))
+	if (!kvm_pte_valid(*pte))
 		return -EAGAIN;
 
 	return BIT(ARM64_HW_PGTABLE_LEVEL_SHIFT(level));
@@ -709,6 +712,20 @@ static bool stage2_pte_is_counted(kvm_pte_t pte, u32 level)
 {
 	return !!pte;
 }
+
+#ifdef CONFIG_ARM64_ELASTIC_TRANSLATIONS
+/* FIXME: rename this to something clearer */
+static bool host_pte_is_contig(struct kvm *kvm, u64 addr, kvm_pte_t *pte)
+{
+	if (!pte)
+		return false;
+
+	if (*pte == 0) {
+		get_user_mapping_size(kvm, addr, pte);
+	}
+	return *pte & PTE_CONT;
+}
+#endif /* CONFIG_ARM64_ELASTIC_TRANSLATIONS */
 
 static struct kvm_pgtable_mm_ops kvm_s2_mm_ops = {
 	.zalloc_page		= stage2_memcache_zalloc_page,
@@ -1189,7 +1206,7 @@ static bool fault_supports_stage2_huge_mapping(struct kvm_memory_slot *memslot,
 static long
 transparent_hugepage_adjust(struct kvm *kvm, struct kvm_memory_slot *memslot,
 			    unsigned long hva, kvm_pfn_t *pfnp,
-			    phys_addr_t *ipap)
+			    phys_addr_t *ipap, kvm_pte_t *host_pte)
 {
 	kvm_pfn_t pfn = *pfnp;
 
@@ -1199,7 +1216,7 @@ transparent_hugepage_adjust(struct kvm *kvm, struct kvm_memory_slot *memslot,
 	 * block map is contained within the memslot.
 	 */
 	if (fault_supports_stage2_huge_mapping(memslot, hva, PMD_SIZE)) {
-		int sz = get_user_mapping_size(kvm, hva);
+		int sz = get_user_mapping_size(kvm, hva, host_pte);
 
 		if (sz < 0)
 			return sz;
@@ -1501,6 +1518,8 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 		fallthrough;
 #endif
 	case CONT_PMD_SHIFT:
+		if (fault_supports_stage2_huge_mapping(memslot, hva, CONT_PMD_SIZE))
+			break;
 		vma_shift = PMD_SHIFT;
 		fallthrough;
 	case PMD_SHIFT:
@@ -1508,6 +1527,9 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 			break;
 		fallthrough;
 	case CONT_PTE_SHIFT:
+		if (fault_supports_stage2_huge_mapping(memslot, hva, CONT_PTE_SIZE)) {
+			break;
+		}
 		vma_shift = PAGE_SHIFT;
 		force_pte = true;
 		fallthrough;
@@ -1518,8 +1540,7 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 	}
 
 	vma_pagesize = 1UL << vma_shift;
-	if (vma_pagesize == PMD_SIZE || vma_pagesize == PUD_SIZE)
-		fault_ipa &= ~(vma_pagesize - 1);
+	fault_ipa &= ~(vma_pagesize - 1);
 
 	gfn = fault_ipa >> PAGE_SHIFT;
 
@@ -1584,12 +1605,23 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 	 * backed by a THP and thus use block mapping if possible.
 	 */
 	if (vma_pagesize == PAGE_SIZE && !(force_pte || device)) {
+		kvm_pte_t host_pte = 0;
 		if (fault_status == FSC_PERM && fault_granule > PAGE_SIZE)
 			vma_pagesize = fault_granule;
 		else
 			vma_pagesize = transparent_hugepage_adjust(kvm, memslot,
 								   hva, &pfn,
-								   &fault_ipa);
+								   &fault_ipa, &host_pte);
+
+#ifdef CONFIG_ARM64_ELASTIC_TRANSLATIONS
+		/* Check if we are backed by an ET and if it's possible to map the SPTEs to it */
+		if (is_et_enabled(kvm->mm) &&
+			fault_supports_stage2_huge_mapping(memslot, hva,
+				vma_pagesize == PMD_SIZE ? CONT_PMD_SIZE : CONT_PTE_SIZE) &&
+			host_pte_is_contig(kvm, hva, &host_pte)) {
+				prot |= KVM_PGTABLE_PROT_RANGEOP;
+		}
+#endif /* CONFIG_ARM64_ELASTIC_TRANSLATIONS */
 
 		if (vma_pagesize < 0) {
 			ret = vma_pagesize;
@@ -1623,8 +1655,8 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 	 * permissions only if vma_pagesize equals fault_granule. Otherwise,
 	 * kvm_pgtable_stage2_map() should be called to change block size.
 	 */
-	if (fault_status == FSC_PERM && vma_pagesize == fault_granule) {
-		ret = kvm_pgtable_stage2_relax_perms(pgt, fault_ipa, prot);
+	if (fault_status == FSC_PERM && vma_pagesize >= fault_granule) {
+		ret = kvm_pgtable_stage2_relax_perms(pgt, fault_ipa, prot, vma_pagesize);
 	} else {
 		WARN_ONCE(use_read_lock, "Attempted stage-2 map outside of write lock\n");
 

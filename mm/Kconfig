@@ -1200,6 +1200,21 @@ config LOCK_MM_AND_FIND_VMA
 	bool
 	depends on !STACK_GROWSUP
 
+config COALAPAGING
+	default n
+	bool "Coalescing-aware CAPaging"
+	depends on TRANSPARENT_HUGEPAGE
+
+	help
+	  Stripped down CAPaging for SW-assisted TLB coalescing"
+
+config PFTRACE
+	bool "Fault latency tracing"
+	depends on TRACEPOINTS
+
+	help
+	  Enable page-fault latency tracepoints (for both vanilla and CA paths)
+
 source "mm/damon/Kconfig"
 
 endmenu

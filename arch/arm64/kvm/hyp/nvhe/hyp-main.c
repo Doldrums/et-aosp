@@ -937,6 +937,17 @@ static void handle___kvm_tlb_flush_vmid(struct kvm_cpu_context *host_ctxt)
 	__kvm_tlb_flush_vmid(kern_hyp_va(mmu));
 }
 
+#ifdef CONFIG_ARM64_ELASTIC_TRANSLATIONS
+static void handle___kvm_tlb_flush_range(struct kvm_cpu_context *host_ctxt)
+{
+	DECLARE_REG(struct kvm_s2_mmu *, mmu, host_ctxt, 1);
+	DECLARE_REG(phys_addr_t, ipa, host_ctxt, 2);
+	DECLARE_REG(int, level, host_ctxt, 3);
+
+	__kvm_tlb_flush_range(kern_hyp_va(mmu), ipa, level);
+}
+#endif /* CONFIG_ARM64_ELASTIC_TRANSLATIONS */
+
 static void handle___kvm_flush_cpu_context(struct kvm_cpu_context *host_ctxt)
 {
 	DECLARE_REG(struct kvm_s2_mmu *, mmu, host_ctxt, 1);
@@ -1332,6 +1343,9 @@ static const hcall_t host_hcall[] = {
 #ifdef CONFIG_ANDROID_ARM64_WORKAROUND_DMA_BEYOND_POC
 	HANDLE_FUNC(__pkvm_host_set_stage2_memattr),
 #endif
+#ifdef CONFIG_ARM64_ELASTIC_TRANSLATIONS
+	HANDLE_FUNC(__kvm_tlb_flush_range),
+#endif /* CONFIG_ARM64_ELASTIC_TRANSLATIONS */
 };
 
 static void handle_host_hcall(struct kvm_cpu_context *host_ctxt)

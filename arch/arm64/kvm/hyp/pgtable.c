@@ -16,6 +16,8 @@
 					 KVM_PTE_LEAF_ATTR_LO_S2_S2AP_W | \
 					 KVM_PTE_LEAF_ATTR_HI_S2_XN)
 
+#define KVM_PTE_LEAF_ATTR_HI_S2_CONT	BIT(52)
+
 struct kvm_pgtable_walk_data {
 	struct kvm_pgtable		*pgt;
 	struct kvm_pgtable_walker	*walker;
@@ -522,6 +524,12 @@ struct stage2_map_data {
 
 	/* Force mappings to page granularity */
 	bool				force_pte;
+
+#ifdef CONFIG_ARM64_ELASTIC_TRANSLATIONS
+	/* True if the underlying host PTEs have been promoted to an ET */
+	bool				rangeop;
+#endif /* CONFIG_ARM64_ELASTIC_TRANSLATIONS */
+
 };
 
 u64 kvm_get_vtcr(u64 mmfr0, u64 mmfr1, u32 phys_shift)
@@ -701,6 +709,85 @@ static bool stage2_leaf_mapping_allowed(u64 addr, u64 end, u32 level,
 	return kvm_block_mapping_supported(addr, end, data->phys, level);
 }
 
+#ifdef CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS
+static int stage2_update_range(kvm_pte_t *ptep, u64 addr, u32 level,
+					kvm_pte_t set, kvm_pte_t clr,
+					struct kvm_pgtable_mm_ops *mm_ops)
+{
+	const uint8_t nr_rptes = max(CONT_PTES, CONT_PMDS);
+	kvm_pte_t *anchor, *rptep;
+
+#ifndef __KVM_NVHE_HYPERVISOR__
+	pr_debug("Updating range, ipa@0x%llx, 0x%llx->0x%llx", addr, *ptep, (*ptep | set) & ~clr);
+#endif
+
+	anchor = PTR_ALIGN_DOWN(ptep, nr_rptes * sizeof(ptep));
+
+	/* FIXME: This shouldn't be necessary */
+	for (rptep = anchor; rptep - anchor < nr_rptes; rptep++) {
+		if (rptep != ptep && !kvm_pte_valid(*rptep)) {
+			return -1;
+		}
+	}
+
+	for (rptep = anchor; rptep - anchor < nr_rptes; rptep++) {
+		kvm_pte_t old = *rptep;
+		kvm_pte_t new = (old | set) & ~clr;
+
+		/* FIXME: Is this necessary? */
+		if (mm_ops->icache_inval_pou &&
+		    stage2_pte_executable(new) && !stage2_pte_executable(old))
+			mm_ops->icache_inval_pou(kvm_pte_follow(new, mm_ops),
+						  kvm_granule_size(level));
+
+		WRITE_ONCE(*rptep, new);
+	}
+
+	return 0;
+}
+
+static int stage2_map_range(kvm_pte_t *ptep, kvm_pte_t pte, u64 addr,
+					u32 level, struct kvm_s2_mmu *mmu)
+{
+	const uint8_t nr_rptes = max(CONT_PTES, CONT_PMDS);
+	kvm_pte_t *anchor, *rptep;
+
+#ifndef __KVM_NVHE_HYPERVISOR__
+	pr_debug("Trying to map range of ipa@0x%llx, checking the range SPTEs...", addr);
+#endif
+
+	/* Get the anchor ptep */
+	anchor = PTR_ALIGN_DOWN(ptep, nr_rptes * sizeof(ptep));
+
+	/* 
+	 * Check if all of the range SPTEs have been created.
+	 *
+	 * FIXME: Can we skip this? e.g. for prefaulted / already promoted ranges
+	 * we could create the range in-place instead of waiting to lazily fault
+	 * all the range SPTEs.
+	 */
+	for (rptep = anchor; rptep - anchor < nr_rptes; rptep++) {
+		if (rptep != ptep && !kvm_pte_valid(*rptep)) {
+			return -1;
+		}
+	}
+
+#ifndef __KVM_NVHE_HYPERVISOR__
+	pr_debug("Mapping range of ipa@0x%llx", addr);
+#endif
+
+	for (rptep = anchor; rptep - anchor < nr_rptes; rptep++) {
+		/* We just need to set the contig bit here */
+		kvm_pte_t new = (ptep == rptep ? pte : *rptep) | KVM_PTE_LEAF_ATTR_HI_S2_CONT;
+		smp_store_release(rptep, new);
+	}
+
+	/* FIXME: Is it ok to skip BBM and the TLB flushing here? */
+
+	return 0;
+}
+#endif /* CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS */
+
 static int stage2_map_walker_try_leaf(u64 addr, u64 end, u32 level,
 				      kvm_pte_t *ptep,
 				      struct stage2_map_data *data)
@@ -750,11 +837,23 @@ static int stage2_map_walker_try_leaf(u64 addr, u64 end, u32 level,
 	if (mm_ops->icache_inval_pou && stage2_pte_executable(new))
 		mm_ops->icache_inval_pou(kvm_pte_follow(new, mm_ops), granule);
 
+#ifdef CONFIG_ARM64_ELASTIC_TRANSLATIONS
+	/*
+		* If rangeop is set, the SPTEs are backed by an ET. Check if all the
+		* SPTEs have been created, and if yes, promote them to an ET.
+		*
+		* If not, fall back to just setting the target SPTE.
+		*/
+	if (data->rangeop && !stage2_map_range(ptep, new, addr, level, data->mmu)) {
+		goto out_set_pte;
+	}
+#endif /* CONFIG_ARM64_ELASTIC_TRANSLATIONS */
+
+smp_store_release(ptep, new);
+
 out_set_pte:
 	if (pte_ops->pte_is_counted_cb(new, level))
 		mm_ops->get_page(ptep);
-
-	smp_store_release(ptep, new);
 	if (kvm_phys_is_valid(phys))
 		data->phys += granule;
 	return 0;
@@ -970,6 +1069,9 @@ int kvm_pgtable_stage2_map(struct kvm_pgtable *pgt, u64 addr, u64 size,
 		.mmu		= pgt->mmu,
 		.memcache	= mc,
 		.mm_ops		= pgt->mm_ops,
+#ifdef CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS
+		.rangeop	= prot & KVM_PGTABLE_PROT_RANGEOP,
+#endif /* CONFIG_HAVE_ARCH_ELASTIC_TRANSLATIONS */
 	};
 	struct kvm_pgtable_walker walker = {
 		.cb		= stage2_map_walker,
@@ -988,6 +1090,9 @@ int kvm_pgtable_stage2_map(struct kvm_pgtable *pgt, u64 addr, u64 size,
 	ret = stage2_set_prot_attr(pgt, prot, &map_data.attr);
 	if (ret)
 		return ret;
+
+	if (size == CONT_PTE_SIZE || size == CONT_PMD_SIZE)
+		map_data.attr |= KVM_PTE_LEAF_ATTR_HI_S2_CONT;
 
 	ret = kvm_pgtable_walk(pgt, addr, size, &walker);
 	dsb(ishst);
@@ -1110,6 +1215,7 @@ struct stage2_attr_data {
 	kvm_pte_t			pte;
 	u32				level;
 	struct kvm_pgtable_mm_ops	*mm_ops;
+	u64 size;
 };
 
 static int stage2_attr_walker(u64 addr, u64 end, u32 level, kvm_pte_t *ptep,
@@ -1127,6 +1233,20 @@ static int stage2_attr_walker(u64 addr, u64 end, u32 level, kvm_pte_t *ptep,
 	data->pte = pte;
 	pte &= ~data->attr_clr;
 	pte |= data->attr_set;
+
+#ifndef __KVM_NVHE_HYPERVISOR__
+	pr_debug("data->pte: 0x%llx, pte: 0x%llx, set: 0x%llx, clr: 0x%llx", data->pte, pte, data->attr_set, data->attr_clr);
+#endif
+
+#ifdef CONFIG_ARM64_ELASTIC_TRANSLATIONS
+	/* Make sure to call update_range only for the ET ranges */
+	if ((data->pte & KVM_PTE_LEAF_ATTR_HI_S2_CONT) &&
+		(data->size == PAGE_SIZE || data->size == PMD_SIZE) &&
+		!stage2_update_range(ptep, addr, level, data->attr_set,
+				data->attr_clr, mm_ops)) {
+		return 0;
+	}
+#endif /* CONFIG_ARM64_ELASTIC_TRANSLATIONS */
 
 	/*
 	 * We may race with the CPU trying to set the access flag here,
@@ -1159,12 +1279,20 @@ static int stage2_update_leaf_attrs(struct kvm_pgtable *pgt, u64 addr,
 		.attr_set	= attr_set & attr_mask,
 		.attr_clr	= attr_clr & attr_mask,
 		.mm_ops		= pgt->mm_ops,
+		.size 		= size,
 	};
 	struct kvm_pgtable_walker walker = {
 		.cb		= stage2_attr_walker,
 		.arg		= &data,
 		.flags		= KVM_PGTABLE_WALK_LEAF,
 	};
+
+	/*
+	 * We only need to modify >1 pages for the hugetlb case. TCR rangeops
+	 * will update the whole range with a single walk / update.
+	 */
+	 if (size == PAGE_SIZE || size == PMD_SIZE)
+	 size = 1;
 
 	ret = kvm_pgtable_walk(pgt, addr, size, &walker);
 	if (ret)
@@ -1216,11 +1344,11 @@ bool kvm_pgtable_stage2_is_young(struct kvm_pgtable *pgt, u64 addr)
 }
 
 int kvm_pgtable_stage2_relax_perms(struct kvm_pgtable *pgt, u64 addr,
-				   enum kvm_pgtable_prot prot)
+				   enum kvm_pgtable_prot prot, u64 size)
 {
 	int ret;
 	u32 level;
-	kvm_pte_t set = 0, clr = 0;
+	kvm_pte_t set = 0, clr = 0, old = 0;
 
 	if (prot & !KVM_PGTABLE_PROT_RWX)
 		return -EINVAL;
@@ -1234,9 +1362,26 @@ int kvm_pgtable_stage2_relax_perms(struct kvm_pgtable *pgt, u64 addr,
 	if (prot & KVM_PGTABLE_PROT_X)
 		clr |= KVM_PTE_LEAF_ATTR_HI_S2_XN;
 
-	ret = stage2_update_leaf_attrs(pgt, addr, 1, set, clr, NULL, &level);
-	if (!ret)
-		kvm_call_hyp(__kvm_tlb_flush_vmid_ipa, pgt->mmu, addr, level);
+	ret = stage2_update_leaf_attrs(pgt, addr, size, set, clr, &old, &level);
+	if (!ret) {
+#ifndef __KVM_NVHE_HYPERVISOR__
+		pr_debug("Relaxing permissions for ipa@0x%llx, old pte=0x%llx, contig=%d, level=%u",
+				addr, old, !!(old & KVM_PTE_LEAF_ATTR_HI_S2_CONT), level);
+#endif
+
+#ifdef CONFIG_ARM64_ELASTIC_TRANSLATIONS
+		/*
+			* If we modified a range, we need to range flush here.
+			*
+			* FIXME: Is this always necessary? Can we skip the S1 vmid flush?
+			* TODO: Switch to the non-shareable flush (see upstream commit).
+			*/
+		if (old & KVM_PTE_LEAF_ATTR_HI_S2_CONT)
+			kvm_call_hyp(__kvm_tlb_flush_range, pgt->mmu, addr, level);
+		else
+#endif /* CONFIG_ARM64_ELASTIC_TRANSLATIONS */
+			kvm_call_hyp(__kvm_tlb_flush_vmid_ipa, pgt->mmu, addr, level);
+	}
 	return ret;
 }
 

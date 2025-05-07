@@ -133,6 +133,10 @@
 
 #include "internal.h"
 
+#ifdef CONFIG_COALAPAGING
+#include <linux/coalapaging.h>
+#endif /* CONFIG_COALAPAGING */
+
 /*
  * Initialise a struct file's readahead state.  Assumes that the caller has
  * memset *ra to zero.
@@ -256,6 +260,11 @@ void page_cache_ra_unbounded(struct readahead_control *ractl,
 			continue;
 		}
 
+#ifdef CONFIG_COALAPAGING
+		if (coala_is_filemap_alloc(current)) {
+			folio = coala_filemap_alloc_folio(gfp_mask, 0, mapping, index + i);
+		} else
+#endif /* CONFIG_COALAPAGING */
 		folio = filemap_alloc_folio(gfp_mask, 0);
 		if (!folio)
 			break;
@@ -490,7 +499,14 @@ static inline int ra_alloc_folio(struct readahead_control *ractl, pgoff_t index,
 		pgoff_t mark, unsigned int order, gfp_t gfp)
 {
 	int err;
-	struct folio *folio = filemap_alloc_folio(gfp, order);
+	struct folio *folio;
+	
+#ifdef CONFIG_COALAPAGING
+	if (coala_is_filemap_alloc(current)) {
+		folio = coala_filemap_alloc_folio(gfp, order, ractl->mapping, index);
+	} else
+#endif /* CONFIG_COALAPAGING */
+		folio = filemap_alloc_folio(gfp, order);
 
 	if (!folio)
 		return -ENOMEM;
