@@ -1396,11 +1396,11 @@ out_unmap:
 	pte_unmap_unlock(pte, ptl);
 
 #ifdef CONFIG_COALAPAGING
-	if (!result && (hpage == COALA_SCANONLY || coala_get_hint(mm, address).val == COALA_HINT_32M)) {
+	if (!result && (page == COALA_SCANONLY || coala_get_hint(mm, address).val == COALA_HINT_32M)) {
 		pr_debug("2m collapse failed with %d", result);
 	}
 
-	if (hpage == COALA_SCANONLY) {
+	if (page == COALA_SCANONLY) {
 		return result;
 	}
 #endif /* CONFIG_COALAPAGING */
@@ -2385,6 +2385,7 @@ static unsigned int khugepaged_scan_mm_slot(unsigned int pages, int *result,
 	struct vm_area_struct *vma;
 	int progress = 0;
 	unsigned long nr = 1;
+	struct page **page = NULL;
 
 	VM_BUG_ON(!pages);
 	lockdep_assert_held(&khugepaged_mm_lock);
@@ -2412,7 +2413,7 @@ static unsigned int khugepaged_scan_mm_slot(unsigned int pages, int *result,
 		goto breakouterloop_mmap_lock;
 	}
 
-	if (mm->owner && mm->owner->comm) {
+	if (mm->owner) {
 		pr_debug("mm 0x%lx (%s), addr: 0x%lx", (unsigned long)mm, mm->owner->comm,
 				khugepaged_scan.address);
 	}
@@ -2423,7 +2424,7 @@ static unsigned int khugepaged_scan_mm_slot(unsigned int pages, int *result,
 		struct timespec64 t0, t1;
 
 		ktime_get_ts64(&t0);
-		ret = coala_khugepaged_scan_mm(mm, &vma, pages, hpage, &progress);
+		ret = coala_khugepaged_scan_mm(mm, &vma, pages, page, &progress, cc);
 		ktime_get_ts64(&t1);
 
 		pr_debug("promotion time: %lld msecs",
@@ -2440,7 +2441,7 @@ static unsigned int khugepaged_scan_mm_slot(unsigned int pages, int *result,
 		}
 	}
 
-	if (mm->owner && mm->owner->comm) {
+	if (mm->owner) {
 		if (mm->et_enabled) {
 			if (coala_hints_enabled(mm)) {
 				pr_debug("coala fallback 0x%lx %s", (unsigned long)mm, mm->owner->comm);
@@ -2460,6 +2461,7 @@ static unsigned int khugepaged_scan_mm_slot(unsigned int pages, int *result,
 	if (unlikely(!mmap_read_trylock(mm)))
 		goto breakouterloop_mmap_lock;
 
+fallback:
 	progress++;
 	if (unlikely(hpage_collapse_test_exit(mm)))
 		goto breakouterloop;
@@ -2516,18 +2518,18 @@ skip:
 						bool cont = false;
 						pr_debug("etheap: trying to promote 0x%lx",
 								khugepaged_scan.address);
-								result = coala_khugepaged_scan_contpmd(mm, vma, 
-								khugepaged_scan.address, hpage, &cont);
+								*result = coala_khugepaged_scan_contpmd(mm, vma, 
+								khugepaged_scan.address, page, &cont, cc);
 						if (cont) {
 							pr_debug("0x%lx already cont",
 									khugepaged_scan.address);
 						}
 						nr = CONT_PMDS;
 
-						if (!IS_ERR_OR_NULL(*hpage)) {
+						if (!IS_ERR_OR_NULL(*page)) {
 							pr_info("freeing contpmd page");
-							coala_khugepaged_free(*hpage);
-							*hpage = NULL;
+							coala_khugepaged_free(*page);
+							*page = NULL;
 						}
 					}
 

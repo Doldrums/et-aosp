@@ -5,10 +5,10 @@
 #define COALA_SCANONLY	((void *)0x1)
 
 /* forward declaration from khugepaged.c */
-static int khugepaged_scan_pmd(struct mm_struct *mm,
-			       struct vm_area_struct *vma,
-			       unsigned long address,
-			       struct page **hpage);
+static int hpage_collapse_scan_pmd(struct mm_struct *mm,
+	struct vm_area_struct *vma,
+	unsigned long address, bool *mmap_locked,
+	struct collapse_control *cc);
 
 /* mm_find_pmd() variation to return the raw pmd pointer */
 static inline pmd_t *mm_find_pmdp(struct mm_struct *mm, unsigned long address) {
@@ -109,7 +109,7 @@ static inline void coala_khugepaged_free(struct page *page) {
 }
 
 static void coala_khugepaged_collapse_contpmd(struct mm_struct *mm,
-		unsigned long address, struct page **hpage, int node) {
+		unsigned long address, struct page **hpage, int node, struct collapse_control *cc) {
 	struct page *page, *new_page;
 	struct folio *folio;
 	struct vm_area_struct *vma;
@@ -131,7 +131,7 @@ static void coala_khugepaged_collapse_contpmd(struct mm_struct *mm,
 		return;
 	}
 
-	if (hugepage_vma_revalidate(mm, address, &vma)) {
+	if (hugepage_vma_revalidate(mm, address, false, &vma, cc)) {
 		mmap_write_unlock(mm);
 		pr_debug("vma revalidate fail");
 		return;
@@ -182,8 +182,7 @@ static void coala_khugepaged_collapse_contpmd(struct mm_struct *mm,
 			LIST_HEAD(compound_pagelist);
 
 			do {
-				if (__collapse_huge_page_isolate(vma, _addr, pte[i],
-							&compound_pagelist)) {
+				if (__collapse_huge_page_isolate(vma, _addr, pte[i], cc, &compound_pagelist)) {
 					break;
 				}
 				pr_warn("collapse failed retrying");
@@ -245,7 +244,7 @@ out_set:
 
 		ptl[i] = pmd_lock(mm, pmdp[i]);
 		BUG_ON(!pmd_none(*pmdp[i]));
-		page_add_new_anon_rmap(new_page, vma, _addr, true);
+		page_add_new_anon_rmap(new_page, vma, _addr);
 		lru_cache_add_inactive_or_unevictable(new_page, vma);
 		if (pte_mapped[i]) {
 			pgtable_trans_huge_deposit(mm, pmdp[i], pgtable[i]);
@@ -273,14 +272,14 @@ out_set:
 
 static int coala_khugepaged_scan_contpmd(struct mm_struct *mm, 
 		struct vm_area_struct *vma, unsigned long address,
-		struct page **hpage, bool *cont) {
+		struct page **hpage, bool *cont, struct collapse_control *cc) {
 	struct folio *folio;
 	pmd_t *pmdp, pmd;
 	spinlock_t *ptl;
 	struct page *page;
 	int ret = 0;
-	int node, i, pmd_none = 0;
-	unsigned long _addr = address, populate[CONT_PMDS];
+	int node, i;
+	unsigned long _addr = address; //, populate[CONT_PMDS];
 
 	*cont = true;
 	pmdp = mm_find_pmdp(mm, address);
@@ -310,9 +309,10 @@ static int coala_khugepaged_scan_contpmd(struct mm_struct *mm,
 			continue;
 		}
 #endif
+		bool scanonly = false;
 
 		if (!pmd_trans_huge(pmd)) {
-			if (!khugepaged_scan_pmd(mm, vma, _addr, COALA_SCANONLY)) {
+			if (!hpage_collapse_scan_pmd(mm, vma, _addr, &scanonly, cc)) {
 				pr_debug("4K collapse failed for 0x%lx, present: %d, transhuge: %d, pmd: %llx",
 						_addr, pmd_present(pmd), pmd_trans_huge(pmd), pmd_val(pmd));
 				goto out_unlock;
@@ -385,17 +385,19 @@ out_unlock:
 			return 1;
 		}
 
-		coala_khugepaged_collapse_contpmd(mm, address, hpage, node);
+		coala_khugepaged_collapse_contpmd(mm, address, hpage, node, cc);
 	}
 	return ret;
 }
 
 static bool coala_khugepaged_scan_mm(struct mm_struct *mm, struct vm_area_struct **vma,
-		unsigned int pages, struct page **hpage, int *progress) {
+		unsigned int pages, struct page **hpage, int *progress, struct collapse_control *cc) {
 	unsigned long idx, addr, nr_pages, i;
 	int ret;
 	bool contpmd, cont, locked = false;
 	struct coala_hint hint;
+
+	bool scanonly = false;
 
 	/* loop through the hints */
 	for (i = 0; i < COALA_HINT_IDXSZ; i++) {
@@ -405,7 +407,7 @@ static bool coala_khugepaged_scan_mm(struct mm_struct *mm, struct vm_area_struct
 
 		locked = true;
 
-		if (unlikely(khugepaged_test_exit(mm))) {
+		if (unlikely(hpage_collapse_test_exit(mm))) {
 			return true;
 		}
 
@@ -437,7 +439,7 @@ static bool coala_khugepaged_scan_mm(struct mm_struct *mm, struct vm_area_struct
 			continue;
 		}
 
-		if (!hugepage_vma_check(*vma, (*vma)->vm_flags)) {
+		if (!hugepage_vma_check(*vma, (*vma)->vm_flags, false, false, cc->is_khugepaged)) {
 			pr_debug("vma not thp for hint!");
 			continue;
 		}
@@ -457,7 +459,7 @@ static bool coala_khugepaged_scan_mm(struct mm_struct *mm, struct vm_area_struct
 
 		if (contpmd) {
 			cont = false;
-			ret = coala_khugepaged_scan_contpmd(mm, *vma, addr, hpage, &cont);
+			ret = coala_khugepaged_scan_contpmd(mm, *vma, addr, hpage, &cont, cc);
 			/* FIXME: khugepaged_hwk */
 			if (cont) {
 				continue;
@@ -473,7 +475,7 @@ static bool coala_khugepaged_scan_mm(struct mm_struct *mm, struct vm_area_struct
 				int i = 0;
 				pr_debug("contpmd promotion failed, falling back to 2m");
 				for (i = 0; i < CONT_PMDS; i++, addr += HPAGE_PMD_SIZE) {
-					ret = khugepaged_scan_pmd(mm, *vma, addr, hpage);
+					ret = hpage_collapse_scan_pmd(mm, *vma, addr, &scanonly, cc);
 					if (!ret) {
 						pmd_t *pmdp = mm_find_pmdp(mm, addr);
 						pr_debug("page %d promotion failed, addr 0x%lx", i, addr);
@@ -492,20 +494,12 @@ static bool coala_khugepaged_scan_mm(struct mm_struct *mm, struct vm_area_struct
 						*hpage = NULL;
 					}
 
-					if (!khugepaged_hwk) {
-						*progress += HPAGE_PMD_NR;
-					}
+					*progress += HPAGE_PMD_NR;
 
 					if (ret == 2) {
-						if (khugepaged_hwk) {
-							*progress += HPAGE_PMD_NR;
-						}
 						pr_debug("promotion 2m fallback success");	
 					} else if (ret == 1) {
 						pr_debug("failed fallback alloc?");
-						if (khugepaged_hwk) {
-							*progress += HPAGE_PMD_NR;
-						}
 					}
 					mmap_read_lock(mm);
 				}
@@ -519,12 +513,10 @@ static bool coala_khugepaged_scan_mm(struct mm_struct *mm, struct vm_area_struct
 				continue;
 			}
 		} else if ((hint.val == COALA_HINT_64K) || (hint.val == COALA_HINT_2M)) {
-			ret = khugepaged_scan_pmd(mm, *vma, addr, hpage);
+			ret = hpage_collapse_scan_pmd(mm, *vma, addr, &scanonly, cc);
 		}
 
-		if (!khugepaged_hwk) {
-			*progress += nr_pages;
-		}
+		*progress += nr_pages;
 
 		if (!IS_ERR_OR_NULL(*hpage)) {
 			if (contpmd) {
@@ -539,14 +531,6 @@ static bool coala_khugepaged_scan_mm(struct mm_struct *mm, struct vm_area_struct
 		}
 
 		if (ret) {
-			if (khugepaged_hwk && ret == 2) {
-				*progress += nr_pages;
-				pr_debug("success? %d %u %lu", *progress, pages, nr_pages);
-				if (*progress >= pages) {
-					return false;
-				}
-			}
-
 			if (ret == 1) {
 				pr_debug("failed alloc? returning");
 				*progress = pages;
